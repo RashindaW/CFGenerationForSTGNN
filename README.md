@@ -18,4 +18,4 @@ Key flags:
 - `--lag` / `--horizon`: historical context and forecast length
 - `--output`: optional path to persist trained weights
 
-Datasets are expected under `preprocessing/data/<DATASET>` with `*_node_values.npy` and `*_adj_mat.npy` files. After validating the Graph WaveNet integration, the copied `Graph-WaveNet-master` directory can be removed.
+Datasets are expected under `preprocessing/data/<DATASET>` with `*_node_values.npy` and `*_adj_mat.npy` files. 
