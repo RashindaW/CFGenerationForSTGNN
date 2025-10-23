@@ -1,0 +1,5 @@
+data/METRLA/*.npy
+data/METRLA/*.zip
+data/PEMSBAY/*.npy
+data/PEMSBAY/*.zip
+__pycache__/

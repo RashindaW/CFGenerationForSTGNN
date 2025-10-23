@@ -5,7 +5,6 @@ import torch
 from torch.utils.data import DataLoader
 import torch_geometric as pyg   
 from torch_geometric import nn, data
-import torch_geometric_temporal as pygt
 from torch_geometric_temporal.dataset import METRLADatasetLoader, PemsBayDatasetLoader
 
 parser = argparse.ArgumentParser()
@@ -31,6 +30,7 @@ class DataReader:
         self.ddp = ddp
         if ddp:
             print("To be implemented: DDP support - need Dask")
+        print(self.data_path)
 
     def read_data(self):
         if self.dataset == 'METRLA':
@@ -41,13 +41,14 @@ class DataReader:
             raise ValueError(f"Dataset {self.dataset} not supported.")
         
     def _read_metrla(self):
-        train,val,test,edges,edge_weight,_,_ = METRLADatasetLoader().get_index_dataset(
+        loader=METRLADatasetLoader(raw_data_dir=self.data_path+'/',index=True)
+        train,val,test,edges,edge_weight,_,_ = loader.get_index_dataset(
             lags=self.lag,
             batch_size=self.batch_size
         )
         return (train, val, test, edges, edge_weight)
     def _read_pemsbay(self):
-        train,val,test,edges,edge_weight,_,_ = PemsBayDatasetLoader().get_index_dataset(
+        train,val,test,edges,edge_weight,_,_ = PemsBayDatasetLoader(raw_data_dir=self.data_path,index=True).get_index_dataset(
             lags=self.lag,
             batch_size=self.batch_size
         )
