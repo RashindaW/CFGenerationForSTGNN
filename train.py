@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import tqdm
 import argparse
 from dataclasses import asdict
 from datetime import datetime
@@ -12,12 +12,13 @@ from torch.utils.data import DataLoader
 
 from models.graphwavenet import GraphWaveNet
 from models.stgcn import STGCN, STGCNConfig
+from models.mstgcn import MSTGCN, MSTGCNConfig
 from preprocessing.data_reader import TemporalDatasetBundle, load_dataset
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train spatio-temporal models on traffic datasets.")
-    parser.add_argument("--model", type=str, choices=["stgcn", "graphwavenet"], default="stgcn")
+    parser.add_argument("--model", type=str, choices=["stgcn", "graphwavenet","mstgcn"], default="stgcn")
     parser.add_argument("--dataset", type=str, choices=["METRLA", "PEMSBAY"], default="METRLA")
     parser.add_argument("--data_root", type=str, default=None, help="Path to dataset root directory.")
     parser.add_argument("--lag", type=int, default=12, help="Number of historical steps.")
@@ -30,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden_channels", type=int, default=32)
     parser.add_argument("--num_layers", type=int, default=2, help="Number of STGCN blocks.")
     parser.add_argument("--temporal_kernel", type=int, default=3)
-    parser.add_argument("--cheb_k", type=int, default=3, help="Chebyshev polynomial order for STGCN.")
+    parser.add_argument("--cheb_k", type=int, default=3, help="Chebyshev polynomial order for STGCN/MSTGCN.")
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience.")
     parser.add_argument("--device", type=str, default=None)
@@ -42,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to store training runs.")
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path to load for testing mode.")
     parser.add_argument("--mode", type=str, choices=["train", "test"], default="train", help="Run training or testing pipeline.")
+    parser.add_argument("--time_strides", type=int, default=1, help="Time strides for MSTGCN.")
     # Graph WaveNet specific
     parser.add_argument("--skip_channels", type=int, default=256)
     parser.add_argument("--end_channels", type=int, default=512)
@@ -90,27 +92,40 @@ def build_model(args: argparse.Namespace, bundle: TemporalDatasetBundle, device:
         )
         model = STGCN(config, adjacency=adjacency)
         return model.to(device)
-
-    supports = [sym_normalized_adjacency(adjacency).to(device)]
-    model = GraphWaveNet(
-        device=device,
-        num_nodes=bundle.num_nodes,
-        dropout=args.dropout,
-        supports=supports,
-        gcn_bool=not args.disable_gcn,
-        addaptadj=not args.disable_adaptive_adj,
-        aptinit=supports[0],
-        in_dim=bundle.num_features,
-        out_dim=args.horizon,
-        residual_channels=args.hidden_channels,
-        dilation_channels=args.hidden_channels,
-        skip_channels=args.skip_channels,
-        end_channels=args.end_channels,
-        kernel_size=args.kernel_size,
-        blocks=args.blocks,
-        layers=args.layers,
-    )
-    return model.to(device)
+    elif args.model == "graphwavenet":
+        supports = [sym_normalized_adjacency(adjacency).to(device)]
+        model = GraphWaveNet(
+            device=device,
+            num_nodes=bundle.num_nodes,
+            dropout=args.dropout,
+            supports=supports,
+            gcn_bool=not args.disable_gcn,
+            addaptadj=not args.disable_adaptive_adj,
+            aptinit=supports[0],
+            in_dim=bundle.num_features,
+            out_dim=args.horizon,
+            residual_channels=args.hidden_channels,
+            dilation_channels=args.hidden_channels,
+            skip_channels=args.skip_channels,
+            end_channels=args.end_channels,
+            kernel_size=args.kernel_size,
+            blocks=args.blocks,
+            layers=args.layers,
+        )
+        return model.to(device)
+    elif args.model == "mstgcn":
+        config = MSTGCNConfig(
+            nb_block=args.num_layers,
+            in_channels=bundle.num_features,
+            K=args.cheb_k,
+            nb_chev_filter=args.hidden_channels,
+            nb_time_filter=args.hidden_channels,
+            time_strides=args.time_strides,
+            num_for_predict=args.horizon,
+            len_input=args.lag,
+        )
+        model = MSTGCN(config, adjacency=adjacency)
+        return model.to(device)
 
 
 def prepare_batch(batch: Tuple[torch.Tensor, torch.Tensor], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -258,7 +273,7 @@ def train_pipeline(args: argparse.Namespace) -> None:
     best_val_loss = float("inf")
     best_epoch = 0
     patience_counter = 0
-
+    pbar = tqdm.tqdm(total=args.epochs, desc="Training Progress")
     for epoch in range(1, args.epochs + 1):
         train_stats = run_epoch(
             model,
@@ -269,6 +284,7 @@ def train_pipeline(args: argparse.Namespace) -> None:
             optimizer=optimizer,
             grad_clip=args.grad_clip,
         )
+        pbar.update(1)
         val_stats = run_epoch(model, loaders["val"], device, args.model, criterion)
 
         print(
@@ -289,6 +305,7 @@ def train_pipeline(args: argparse.Namespace) -> None:
             if args.patience and patience_counter >= args.patience:
                 print("Early stopping triggered.")
                 break
+    pbar.close()
 
     if best_val_loss == float("inf"):
         print("Training finished without improvement; no checkpoint saved.")
@@ -348,7 +365,10 @@ def test_pipeline(args: argparse.Namespace) -> None:
     model.load_state_dict(checkpoint[state_key])  # type: ignore[arg-type]
 
     criterion = nn.L1Loss()
+    pbar = tqdm.tqdm(total=1, desc="Testing Progress")
     test_stats = run_epoch(model, loaders["test"], device, model_type, criterion)
+    pbar.update(1)
+    pbar.close()
     print(
         f"Test | Loss: {test_stats['loss']:.4f} MAE: {test_stats['mae']:.4f} RMSE: {test_stats['rmse']:.4f}"
     )
