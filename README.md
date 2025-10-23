@@ -19,6 +19,7 @@ python train.py --mode train --model stgcn --dataset METRLA
 - Splits the dataset into 70 % train, 10 % validation, 20 % test.
 - Tracks validation loss and saves the best checkpoint to `checkpoints/<timestamp>_<model>_<dataset>/best.pt` by default.
 - Override the destination with `--checkpoint_dir` or a full `--output` path if you want to name the file yourself.
+- Tune hyperparameters on the fly; e.g. `--epochs 100`, `--batch_size 32`, `--learning_rate 3e-4`, `--weight_decay 1e-5`, `--patience 20`, `--grad_clip 2.0`.
 
 ## Testing
 
@@ -28,6 +29,7 @@ python train.py --mode test --checkpoint checkpoints/<timestamp>_<model>_<datase
 
 - Rebuilds the model using the saved training arguments and evaluates only on the stored test split.
 - Add flags such as `--data_root` if you need to point at a different dataset location than was captured in the checkpoint.
+- You can still override evaluation settings (e.g. `--batch_size 128`) when re-running in test mode.
 
 ## Useful Flags
 
