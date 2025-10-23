@@ -1,5 +1,3 @@
-data/METRLA/*.npy
-data/METRLA/*.zip
-data/PEMSBAY/*.npy
-data/PEMSBAY/*.zip
+# Ignore all files in data folder
+preprocessing/data/
 __pycache__/
