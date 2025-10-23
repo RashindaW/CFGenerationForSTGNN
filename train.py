@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Dict, Tuple
 
 import torch
 from torch import nn
@@ -38,6 +39,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--output", type=str, default=None, help="Optional path to save trained weights.")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to store training runs.")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path to load for testing mode.")
+    parser.add_argument("--mode", type=str, choices=["train", "test"], default="train", help="Run training or testing pipeline.")
     # Graph WaveNet specific
     parser.add_argument("--skip_channels", type=int, default=256)
     parser.add_argument("--end_channels", type=int, default=512)
@@ -190,8 +194,46 @@ def run_epoch(
     }
 
 
-def main() -> None:
-    args = parse_args()
+def resolve_checkpoint_destination(args: argparse.Namespace) -> Tuple[Path, Path]:
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        return output_path.parent, output_path
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name = f"{timestamp}_{args.model}_{args.dataset}"
+    base_dir = Path(args.checkpoint_dir)
+    run_dir = base_dir / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir, run_dir / "best.pt"
+
+
+def save_checkpoint(
+    path: Path,
+    args: argparse.Namespace,
+    model: torch.nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+    epoch: int,
+    train_stats: Dict[str, float],
+    val_stats: Dict[str, float],
+) -> None:
+    args_dict = vars(args).copy()
+    checkpoint = {
+        "epoch": epoch,
+        "model_state": state_dict,
+        "model_type": args.model,
+        "dataset": args.dataset,
+        "metrics": {"train": train_stats, "val": val_stats},
+        "timestamp": datetime.now().isoformat(),
+        "config": {
+            "args": args_dict,
+            "stgcn_config": asdict(model.config) if hasattr(model, "config") else None,
+        },
+    }
+    torch.save(checkpoint, path)
+
+
+def train_pipeline(args: argparse.Namespace) -> None:
     device = resolve_device(args.device)
     data_root = Path(args.data_root) if args.data_root else None
 
@@ -210,8 +252,11 @@ def main() -> None:
     criterion = nn.L1Loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
-    best_state: Dict[str, Any] | None = None
+    run_dir, checkpoint_path = resolve_checkpoint_destination(args)
+    print(f"Saving checkpoints under {run_dir}")
+
     best_val_loss = float("inf")
+    best_epoch = 0
     patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -234,38 +279,87 @@ def main() -> None:
 
         if val_stats["loss"] < best_val_loss:
             best_val_loss = val_stats["loss"]
+            best_epoch = epoch
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            save_checkpoint(checkpoint_path, args, model, best_state, epoch, train_stats, val_stats)
             patience_counter = 0
+            print(f"New best model saved to {checkpoint_path}")
         else:
             patience_counter += 1
             if args.patience and patience_counter >= args.patience:
                 print("Early stopping triggered.")
                 break
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+    if best_val_loss == float("inf"):
+        print("Training finished without improvement; no checkpoint saved.")
+    else:
+        print(f"Best validation loss {best_val_loss:.4f} achieved at epoch {best_epoch:03d}.")
+        print(f"Best checkpoint available at {checkpoint_path}.")
 
-    test_stats = run_epoch(model, loaders["test"], device, args.model, criterion)
+
+def test_pipeline(args: argparse.Namespace) -> None:
+    if not args.checkpoint:
+        raise ValueError("--checkpoint must be provided in test mode.")
+
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
+
+    device = resolve_device(args.device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    checkpoint_args = checkpoint.get("config", {}).get("args", {})
+    model_args = argparse.Namespace(**checkpoint_args) if checkpoint_args else argparse.Namespace()
+
+    dataset_name = checkpoint.get("dataset") or getattr(model_args, "dataset", args.dataset)
+    if dataset_name:
+        dataset_name = dataset_name.upper()
+
+    stored_data_root = checkpoint_args.get("data_root") if checkpoint_args else None
+    data_root_value = args.data_root if args.data_root is not None else stored_data_root
+    data_root = Path(data_root_value) if data_root_value else None
+
+    lag = checkpoint_args.get("lag", args.lag) if checkpoint_args else args.lag
+    horizon = checkpoint_args.get("horizon", args.horizon) if checkpoint_args else args.horizon
+    train_ratio = checkpoint_args.get("train_ratio", args.train_ratio) if checkpoint_args else args.train_ratio
+    val_ratio = checkpoint_args.get("val_ratio", args.val_ratio) if checkpoint_args else args.val_ratio
+    target_channel = checkpoint_args.get("target_channel", args.target_channel) if checkpoint_args else args.target_channel
+
+    batch_size = checkpoint_args.get("batch_size", args.batch_size) if checkpoint_args else args.batch_size
+    num_workers = checkpoint_args.get("num_workers", args.num_workers) if checkpoint_args else args.num_workers
+
+    bundle = load_dataset(
+        dataset=dataset_name,
+        lag=lag,
+        horizon=horizon,
+        data_root=data_root,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        target_channel=target_channel,
+    )
+    loaders = build_dataloaders(bundle, batch_size, num_workers)
+
+    model_type = checkpoint.get("model_type", getattr(model_args, "model", args.model))
+    if checkpoint_args:
+        model_args.mode = "train"
+    model = build_model(model_args if checkpoint_args else args, bundle, device)
+
+    state_key = "model_state" if "model_state" in checkpoint else "model"
+    model.load_state_dict(checkpoint[state_key])  # type: ignore[arg-type]
+
+    criterion = nn.L1Loss()
+    test_stats = run_epoch(model, loaders["test"], device, model_type, criterion)
     print(
         f"Test | Loss: {test_stats['loss']:.4f} MAE: {test_stats['mae']:.4f} RMSE: {test_stats['rmse']:.4f}"
     )
 
-    if args.output:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "model_type": args.model,
-                "dataset": args.dataset,
-                "config": {
-                    "args": vars(args),
-                    "stgcn_config": asdict(model.config) if args.model == "stgcn" else None,
-                },
-            },
-            output_path,
-        )
-        print(f"Model checkpoint saved to {output_path}")
+
+def main() -> None:
+    args = parse_args()
+    if args.mode == "train":
+        train_pipeline(args)
+    else:
+        test_pipeline(args)
 
 
 if __name__ == "__main__":
