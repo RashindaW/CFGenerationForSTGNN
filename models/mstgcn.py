@@ -56,8 +56,8 @@ class MSTGCNBlock(nn.Module):
         self, X: torch.FloatTensor, edge_index: torch.LongTensor, edge_weight: Optional[torch.FloatTensor] = None
     ) -> torch.FloatTensor:
 
-        batch_size,num_of_timesteps,num_of_vertices, in_channels = X.shape
-        X=X.permute(0,2,3,1)
+        batch_size,num_of_vertices,in_channels,num_of_timesteps = X.shape
+        # X=X.permute(0,2,1,3)
 
         if not isinstance(edge_index, list):
 
@@ -70,6 +70,7 @@ class MSTGCNBlock(nn.Module):
                 num_of_vertices, in_channels, num_of_timesteps * batch_size
             )
             X_tilde = X_tilde.permute(2, 0, 1)
+            # print(X_tilde.shape,edge_index.shape,edge_weight.shape,lambda_max)
             X_tilde = F.relu(
                 self._cheb_conv(x=X_tilde, edge_index=edge_index, edge_weight=edge_weight, lambda_max=lambda_max)
             )
@@ -166,7 +167,7 @@ class MSTGCN(nn.Module):
 
     def forward(self, x: torch.Tensor, adjacency: Optional[torch.Tensor] = None) -> torch.Tensor:
         edge_index, edge_weight = self._resolve_graph(adjacency)
-        print(edge_weight.shape)
+        x=x.permute(0,2,1,3) #mstgcn requires (batch, nodes, features, steps)
         for block in self._blocklist:
             x = block(x, edge_index,edge_weight)
 

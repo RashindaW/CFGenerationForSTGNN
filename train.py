@@ -124,6 +124,7 @@ def build_model(args: argparse.Namespace, bundle: TemporalDatasetBundle, device:
             num_for_predict=args.horizon,
             len_input=args.lag,
         )
+        
         model = MSTGCN(config, adjacency=adjacency)
         return model.to(device)
 
@@ -186,6 +187,7 @@ def run_epoch(
 
     for batch in loader:
         x, target = prepare_batch(batch, device)
+        # print(x.shape,target.shape)
         if is_train:
             optimizer.zero_grad()
         with torch.set_grad_enabled(is_train):
