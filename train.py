@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon", type=int, default=12, help="Prediction horizon.")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--hidden_channels", type=int, default=32)
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory to store training runs.")
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path to load for testing mode.")
     parser.add_argument("--mode", type=str, choices=["train", "test"], default="train", help="Run training or testing pipeline.")
-    parser.add_argument("--time_strides", type=int, default=1, help="Time strides for MSTGCN.")
+    parser.add_argument("--time_strides", type=int, default=3, help="Time strides for MSTGCN.")
     # Graph WaveNet specific
     parser.add_argument("--skip_channels", type=int, default=256)
     parser.add_argument("--end_channels", type=int, default=512)
