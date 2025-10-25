@@ -13,12 +13,13 @@ from torch.utils.data import DataLoader
 from models.graphwavenet import GraphWaveNet
 from models.stgcn import STGCN, STGCNConfig
 from models.mstgcn import MSTGCN, MSTGCNConfig
+from models.astgcn import ASTGCN, ASTGCNConfig
 from preprocessing.data_reader import TemporalDatasetBundle, load_dataset
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train spatio-temporal models on traffic datasets.")
-    parser.add_argument("--model", type=str, choices=["stgcn", "graphwavenet","mstgcn"], default="stgcn")
+    parser.add_argument("--model", type=str, choices=["stgcn", "graphwavenet","mstgcn", "astgcn"], default="stgcn")
     parser.add_argument("--dataset", type=str, choices=["METRLA", "PEMSBAY"], default="METRLA")
     parser.add_argument("--data_root", type=str, default=None, help="Path to dataset root directory.")
     parser.add_argument("--lag", type=int, default=12, help="Number of historical steps.")
@@ -127,6 +128,22 @@ def build_model(args: argparse.Namespace, bundle: TemporalDatasetBundle, device:
         
         model = MSTGCN(config, adjacency=adjacency)
         return model.to(device)
+    
+    elif args.model == "astgcn":
+        config = ASTGCNConfig(
+            num_of_vertices=bundle.num_nodes,
+            in_channels=bundle.num_features,
+            nb_block=args.num_layers,
+            K=args.cheb_k,
+            nb_chev_filter=args.hidden_channels,
+            nb_time_filter=args.hidden_channels,
+            time_strides=args.time_strides,
+            len_input=args.lag,
+            normalization="sym",
+            bias=True,
+        )
+        model = ASTGCN(config, adjacency=adjacency)
+        return model.to(device)
 
 
 def prepare_batch(batch: Tuple[torch.Tensor, torch.Tensor], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -155,6 +172,7 @@ def forward_pass(
         return output
 
     output = model(x)
+    # print(output.shape)
     if output.dim() == 4 and output.size(1) == 1:
         output = output.squeeze(1)
     elif output.dim() == 4:
