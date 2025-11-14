@@ -28,15 +28,36 @@ def _extract(a: torch.Tensor, t: torch.Tensor, x_shape: torch.Size) -> torch.Ten
 class DiffusionModel(nn.Module):
     """DDPM wrapper with guidance-aware sampling utilities."""
 
-    def __init__(self, network: nn.Module, config: DiffusionConfig) -> None:
+    def __init__(self, network: nn.Module, config: DiffusionConfig, gpu_ids: Optional[List[int]] = None) -> None:
         super().__init__()
         self.network = network
+        self.device_ids = gpu_ids if gpu_ids and len(gpu_ids) > 1 and torch.cuda.is_available() else None
         self.config = config
         betas = build_beta_schedule(config.beta_schedule, config.timesteps, config.beta_start, config.beta_end)
         terms = prepare_diffusion_terms(betas)
         for name, tensor in terms.items():
             self.register_buffer(name, tensor)
         self.timesteps = config.timesteps
+
+    @staticmethod
+    def _prepare_adjacency(adjacency: torch.Tensor, batch_size: int, device: torch.device) -> torch.Tensor:
+        adjacency = adjacency.to(device)
+        if adjacency.dim() == 2:
+            adjacency = adjacency.unsqueeze(0)
+        if adjacency.size(0) == 1 and batch_size > 1:
+            adjacency = adjacency.expand(batch_size, -1, -1)
+        return adjacency
+
+    @staticmethod
+    def _prepare_temporal_context(
+        temporal_context: Optional[torch.Tensor], batch_size: int, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        if temporal_context is None:
+            return None
+        temporal_context = temporal_context.to(device)
+        if temporal_context.size(0) == 1 and batch_size > 1:
+            temporal_context = temporal_context.expand(batch_size, -1, -1, -1)
+        return temporal_context
 
     def forward(
         self,
@@ -45,6 +66,15 @@ class DiffusionModel(nn.Module):
         adjacency: torch.Tensor,
         temporal_context: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        batch_size = x.size(0)
+        adjacency = self._prepare_adjacency(adjacency, batch_size, x.device)
+        temporal_context = self._prepare_temporal_context(temporal_context, batch_size, x.device)
+        if self.device_ids:
+            return nn.parallel.data_parallel(
+                self.network,
+                (x, timesteps, adjacency, temporal_context),
+                device_ids=self.device_ids,
+            )
         return self.network(x, timesteps, adjacency=adjacency, temporal_context=temporal_context)
 
     # --------------------- Training utilities --------------------- #

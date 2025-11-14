@@ -2,13 +2,18 @@ from __future__ import annotations
 import tqdm
 import argparse
 from dataclasses import asdict
+import math
+import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from models.graphwavenet import GraphWaveNet
 from models.stgcn import STGCN, STGCNConfig
@@ -36,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience.")
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--gpus", type=str, default=None, help="Comma-separated CUDA device IDs, e.g., '0,1'.")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--target_channel", type=int, default=0, help="Feature channel to forecast.")
     parser.add_argument("--train_ratio", type=float, default=0.7)
@@ -53,13 +59,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--disable_gcn", action="store_true")
     parser.add_argument("--disable_adaptive_adj", action="store_true")
-    return parser.parse_args()
+    parser.add_argument("--dist_port", type=int, default=29500, help="TCP port for distributed training rendezvous.")
+    args = parser.parse_args()
+    args.gpu_ids = parse_gpu_ids(args.gpus)
+    return args
 
 
-def resolve_device(name: str | None) -> torch.device:
+def parse_gpu_ids(gpu_string: Optional[str]) -> Optional[List[int]]:
+    if not gpu_string:
+        return None
+    ids: List[int] = []
+    for token in gpu_string.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        ids.append(int(token))
+    return ids or None
+
+
+def resolve_device(name: str | None, gpu_ids: Optional[List[int]] = None) -> torch.device:
     if name:
         return torch.device(name)
+    if gpu_ids and torch.cuda.is_available():
+        primary = gpu_ids[0]
+        return torch.device(f"cuda:{primary}")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    if isinstance(model, (nn.DataParallel, nn.parallel.DistributedDataParallel)):
+        return model.module
+    return model
+
+
+def init_distributed(rank: int, world_size: int, port: int) -> None:
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", str(port))
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+
+def cleanup_distributed() -> None:
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def sym_normalized_adjacency(adj: torch.Tensor) -> torch.Tensor:
@@ -71,12 +113,58 @@ def sym_normalized_adjacency(adj: torch.Tensor) -> torch.Tensor:
     diag = torch.diag(degree_inv_sqrt)
     return diag @ adj @ diag
 
-def build_dataloaders(bundle: TemporalDatasetBundle, batch_size: int, num_workers: int) -> Dict[str, DataLoader]:
-    return {
-        "train": DataLoader(bundle.train, batch_size=batch_size, shuffle=True, num_workers=num_workers),
-        "val": DataLoader(bundle.val, batch_size=batch_size, shuffle=False, num_workers=num_workers),
-        "test": DataLoader(bundle.test, batch_size=batch_size, shuffle=False, num_workers=num_workers),
+def build_dataloaders(
+    bundle: TemporalDatasetBundle,
+    batch_size: int,
+    num_workers: int,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+) -> Tuple[Dict[str, DataLoader], Dict[str, Optional[DistributedSampler]]]:
+    train_sampler = (
+        DistributedSampler(bundle.train, num_replicas=world_size, rank=rank, shuffle=True)
+        if distributed
+        else None
+    )
+    val_sampler = (
+        DistributedSampler(bundle.val, num_replicas=world_size, rank=rank, shuffle=False)
+        if distributed
+        else None
+    )
+    test_sampler = (
+        DistributedSampler(bundle.test, num_replicas=world_size, rank=rank, shuffle=False)
+        if distributed
+        else None
+    )
+
+    loaders = {
+        "train": DataLoader(
+            bundle.train,
+            batch_size=batch_size,
+            shuffle=not distributed,
+            sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        ),
+        "val": DataLoader(
+            bundle.val,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        ),
+        "test": DataLoader(
+            bundle.test,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=test_sampler,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),
+        ),
     }
+    samplers = {"train": train_sampler, "val": val_sampler, "test": test_sampler}
+    return loaders, samplers
 
 
 def build_model(args: argparse.Namespace, bundle: TemporalDatasetBundle, device: torch.device) -> torch.nn.Module:
@@ -194,18 +282,19 @@ def run_epoch(
     criterion: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
     grad_clip: float | None = None,
+    distributed: bool = False,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
     total_loss = 0.0
-    total_mae = 0.0
-    total_rmse = 0.0
-    num_batches = 0
+    total_abs_error = 0.0
+    total_sq_error = 0.0
+    total_elements = 0.0
 
     for batch in loader:
         x, target = prepare_batch(batch, device)
-        # print(x.shape,target.shape)
+        batch_elements = float(target.numel())
         if is_train:
             optimizer.zero_grad()
         with torch.set_grad_enabled(is_train):
@@ -216,16 +305,27 @@ def run_epoch(
                 if grad_clip is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
-        mae, rmse = compute_metrics(prediction, target)
-        total_loss += loss.item()
-        total_mae += mae
-        total_rmse += rmse
-        num_batches += 1
+        abs_error = torch.sum(torch.abs(prediction - target)).item()
+        sq_error = torch.sum((prediction - target) ** 2).item()
+        total_loss += loss.item() * batch_elements
+        total_abs_error += abs_error
+        total_sq_error += sq_error
+        total_elements += batch_elements
 
+    if distributed and dist.is_initialized():
+        tensor = torch.tensor(
+            [total_loss, total_abs_error, total_sq_error, total_elements],
+            device=device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        total_loss, total_abs_error, total_sq_error, total_elements = tensor.tolist()
+
+    total_elements = max(total_elements, 1.0)
     return {
-        "loss": total_loss / max(1, num_batches),
-        "mae": total_mae / max(1, num_batches),
-        "rmse": total_rmse / max(1, num_batches),
+        "loss": total_loss / total_elements,
+        "mae": total_abs_error / total_elements,
+        "rmse": math.sqrt(total_sq_error / total_elements),
     }
 
 
@@ -269,69 +369,15 @@ def save_checkpoint(
 
 
 def train_pipeline(args: argparse.Namespace) -> None:
-    device = resolve_device(args.device)
-    data_root = Path(args.data_root) if args.data_root else None
-
-    bundle = load_dataset(
-        dataset=args.dataset,
-        lag=args.lag,
-        horizon=args.horizon,
-        data_root=data_root,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-        target_channel=args.target_channel,
-    )
-    loaders = build_dataloaders(bundle, args.batch_size, args.num_workers)
-    model = build_model(args, bundle, device)
-
-    criterion = nn.L1Loss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-
+    gpu_ids = getattr(args, "gpu_ids", None)
     run_dir, checkpoint_path = resolve_checkpoint_destination(args)
-    print(f"Saving checkpoints under {run_dir}")
-
-    best_val_loss = float("inf")
-    best_epoch = 0
-    patience_counter = 0
-    pbar = tqdm.tqdm(total=args.epochs, desc="Training Progress")
-    for epoch in range(1, args.epochs + 1):
-        train_stats = run_epoch(
-            model,
-            loaders["train"],
-            device,
-            args.model,
-            criterion,
-            optimizer=optimizer,
-            grad_clip=args.grad_clip,
-        )
-        pbar.update(1)
-        val_stats = run_epoch(model, loaders["val"], device, args.model, criterion)
-
-        print(
-            f"Epoch {epoch:03d} | "
-            f"Train Loss: {train_stats['loss']:.4f} MAE: {train_stats['mae']:.4f} RMSE: {train_stats['rmse']:.4f} | "
-            f"Val Loss: {val_stats['loss']:.4f} MAE: {val_stats['mae']:.4f} RMSE: {val_stats['rmse']:.4f}"
-        )
-
-        if val_stats["loss"] < best_val_loss:
-            best_val_loss = val_stats["loss"]
-            best_epoch = epoch
-            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-            save_checkpoint(checkpoint_path, args, model, best_state, epoch, train_stats, val_stats)
-            patience_counter = 0
-            print(f"New best model saved to {checkpoint_path}")
-        else:
-            patience_counter += 1
-            if args.patience and patience_counter >= args.patience:
-                print("Early stopping triggered.")
-                break
-    pbar.close()
-
-    if best_val_loss == float("inf"):
-        print("Training finished without improvement; no checkpoint saved.")
+    args.resolved_run_dir = str(run_dir)
+    args.resolved_checkpoint_path = str(checkpoint_path)
+    if gpu_ids and len(gpu_ids) > 1:
+        world_size = len(gpu_ids)
+        mp.spawn(train_worker, args=(args, gpu_ids, True), nprocs=world_size, join=True)
     else:
-        print(f"Best validation loss {best_val_loss:.4f} achieved at epoch {best_epoch:03d}.")
-        print(f"Best checkpoint available at {checkpoint_path}.")
+        train_worker(0, args, gpu_ids, False)
 
 
 def test_pipeline(args: argparse.Namespace) -> None:
@@ -342,7 +388,8 @@ def test_pipeline(args: argparse.Namespace) -> None:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
 
-    device = resolve_device(args.device)
+    gpu_ids = getattr(args, "gpu_ids", None)
+    device = resolve_device(args.device, gpu_ids)
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     checkpoint_args = checkpoint.get("config", {}).get("args", {})
@@ -392,6 +439,116 @@ def test_pipeline(args: argparse.Namespace) -> None:
     print(
         f"Test | Loss: {test_stats['loss']:.4f} MAE: {test_stats['mae']:.4f} RMSE: {test_stats['rmse']:.4f}"
     )
+
+
+def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int]], distributed: bool) -> None:
+    world_size = len(gpu_ids) if gpu_ids else 1
+    device = None
+    if distributed:
+        init_distributed(rank, world_size, args.dist_port)
+        device = torch.device(f"cuda:{gpu_ids[rank]}")
+        torch.cuda.set_device(device.index)
+    else:
+        device = resolve_device(args.device, gpu_ids)
+
+    data_root = Path(args.data_root) if args.data_root else None
+    bundle = load_dataset(
+        dataset=args.dataset,
+        lag=args.lag,
+        horizon=args.horizon,
+        data_root=data_root,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        target_channel=args.target_channel,
+    )
+    loaders, samplers = build_dataloaders(
+        bundle,
+        args.batch_size,
+        args.num_workers,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+    )
+    model = build_model(args, bundle, device)
+    if distributed:
+        assert device.index is not None
+        model = nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[device.index],
+            output_device=device.index,
+        )
+
+    criterion = nn.L1Loss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    run_dir = Path(getattr(args, "resolved_run_dir"))
+    checkpoint_path = Path(getattr(args, "resolved_checkpoint_path"))
+    if rank == 0:
+        print(f"Saving checkpoints under {run_dir}")
+
+    best_val_loss = float("inf")
+    best_epoch = 0
+    patience_counter = 0
+    stop_training = False
+    for epoch in range(1, args.epochs + 1):
+        if distributed and samplers["train"] is not None:
+            samplers["train"].set_epoch(epoch)
+        train_stats = run_epoch(
+            model,
+            loaders["train"],
+            device,
+            args.model,
+            criterion,
+            optimizer=optimizer,
+            grad_clip=args.grad_clip,
+            distributed=distributed,
+        )
+        val_stats = run_epoch(
+            model,
+            loaders["val"],
+            device,
+            args.model,
+            criterion,
+            distributed=distributed,
+        )
+
+        if rank == 0:
+            print(
+                f"Epoch {epoch:03d} | "
+                f"Train Loss: {train_stats['loss']:.4f} MAE: {train_stats['mae']:.4f} RMSE: {train_stats['rmse']:.4f} | "
+                f"Val Loss: {val_stats['loss']:.4f} MAE: {val_stats['mae']:.4f} RMSE: {val_stats['rmse']:.4f}"
+            )
+            if val_stats["loss"] < best_val_loss:
+                best_val_loss = val_stats["loss"]
+                best_epoch = epoch
+                model_to_save = unwrap_model(model)
+                best_state = {k: v.detach().cpu() for k, v in model_to_save.state_dict().items()}
+                save_checkpoint(checkpoint_path, args, model_to_save, best_state, epoch, train_stats, val_stats)
+                patience_counter = 0
+                print(f"New best model saved to {checkpoint_path}")
+            else:
+                patience_counter += 1
+                if args.patience and patience_counter >= args.patience:
+                    print("Early stopping triggered.")
+                    stop_training = True
+
+        if distributed:
+            stop_tensor = torch.tensor(1 if stop_training else 0, device=device)
+            dist.broadcast(stop_tensor, src=0)
+            if stop_tensor.item() == 1:
+                stop_training = True
+        if stop_training:
+            break
+
+    if rank == 0:
+        if best_val_loss == float("inf"):
+            print("Training finished without improvement; no checkpoint saved.")
+        else:
+            print(f"Best validation loss {best_val_loss:.4f} achieved at epoch {best_epoch:03d}.")
+            print(f"Best checkpoint available at {checkpoint_path}.")
+
+    if distributed:
+        cleanup_distributed()
 
 
 def main() -> None:

@@ -44,6 +44,7 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--gpus", type=str, default=None, help="Comma-separated CUDA device IDs, e.g., '0,1'.")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--target_channel", type=int, default=0)
     parser.add_argument("--train_ratio", type=float, default=0.7)
@@ -76,6 +77,7 @@ def add_diffusion_subcommand(subparsers: argparse._SubParsersAction[argparse.Arg
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--gpus", type=str, default=None, help="Comma-separated CUDA device IDs, e.g., '0,1'.")
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--target_channel", type=int, default=0)
@@ -117,6 +119,7 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
     parser.add_argument("--lower_bound", type=float, default=None)
     parser.add_argument("--upper_bound", type=float, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--gpus", type=str, default=None, help="Comma-separated CUDA device IDs, e.g., '0,1'.")
     parser.add_argument("--output_path", type=str, default="counterfactual_samples.pt")
     parser.add_argument("--warm_start", action="store_true", help="Warm-start guidance from the observed trajectory.")
     parser.set_defaults(handler=run_counterfactual_command)
@@ -129,7 +132,10 @@ def parse_args() -> argparse.Namespace:
     add_forecaster_subcommand(subparsers)
     add_diffusion_subcommand(subparsers)
     add_counterfactual_subcommand(subparsers)
-    return parser.parse_args()
+    args = parser.parse_args()
+    gpus = getattr(args, "gpus", None)
+    args.gpu_ids = forecaster_module.parse_gpu_ids(gpus)
+    return args
 
 
 # ------------------------- Diffusion helpers ------------------------- #
@@ -184,7 +190,7 @@ def save_diffusion_checkpoint(
     torch.save(checkpoint, path)
 
 
-def load_diffusion_checkpoint(path: Path, device: torch.device) -> Tuple[DiffusionModel, Dict[str, Any]]:
+def load_diffusion_checkpoint(path: Path, device: torch.device, gpu_ids: Optional[List[int]] = None) -> Tuple[DiffusionModel, Dict[str, Any]]:
     checkpoint = torch.load(path, map_location=device)
     config = DiffusionConfig(**checkpoint["config"])
     model_meta = checkpoint["model_meta"]
@@ -194,8 +200,8 @@ def load_diffusion_checkpoint(path: Path, device: torch.device) -> Tuple[Diffusi
         channel_multipliers=tuple(model_meta["channel_multipliers"]),
         time_embedding_dim=model_meta["time_embedding_dim"],
         dropout=model_meta["dropout"],
-    )
-    diffusion = DiffusionModel(network, config).to(device)
+    ).to(device)
+    diffusion = DiffusionModel(network, config, gpu_ids=gpu_ids).to(device)
     diffusion.load_state_dict(checkpoint["model_state"])
     return diffusion, checkpoint
 
@@ -209,7 +215,7 @@ def run_forecaster_command(args: argparse.Namespace) -> None:
 
 
 def run_diffusion_command(args: argparse.Namespace) -> None:
-    device = forecaster_module.resolve_device(args.device)
+    device = forecaster_module.resolve_device(args.device, args.gpu_ids)
     data_root = Path(args.data_root) if args.data_root else None
     bundle = load_dataset(
         dataset=args.dataset,
@@ -228,9 +234,9 @@ def run_diffusion_command(args: argparse.Namespace) -> None:
         channel_multipliers=tuple(args.diffusion_channel_mults),
         time_embedding_dim=args.diffusion_time_dim,
         dropout=args.diffusion_dropout,
-    )
+    ).to(device)
     diffusion_config = create_diffusion_config(args)
-    diffusion = DiffusionModel(network, diffusion_config).to(device)
+    diffusion = DiffusionModel(network, diffusion_config, gpu_ids=args.gpu_ids).to(device)
 
     optimizer = torch.optim.AdamW(diffusion.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     trainer = DiffusionTrainer(
@@ -348,13 +354,15 @@ def load_forecaster_from_checkpoint(path: Path, device: torch.device, data_root_
 
 
 def run_counterfactual_command(args: argparse.Namespace) -> None:
-    device = forecaster_module.resolve_device(args.device)
+    device = forecaster_module.resolve_device(args.device, args.gpu_ids)
     forecaster_path = Path(args.forecaster_checkpoint)
     diffusion_path = Path(args.diffusion_checkpoint)
 
-    forecaster, bundle, dataset_meta = load_forecaster_from_checkpoint(forecaster_path, device, Path(args.data_root) if args.data_root else None)
+    forecaster, bundle, dataset_meta = load_forecaster_from_checkpoint(
+        forecaster_path, device, Path(args.data_root) if args.data_root else None
+    )
 
-    diffusion, diffusion_ckpt = load_diffusion_checkpoint(diffusion_path, device)
+    diffusion, diffusion_ckpt = load_diffusion_checkpoint(diffusion_path, device, gpu_ids=args.gpu_ids)
     dataset_info = diffusion_ckpt.get("dataset_meta", {})
     if dataset_info.get("dataset") and dataset_info.get("dataset") != dataset_meta["dataset"]:
         print("Warning: Forecaster and diffusion checkpoints were trained on different datasets.")

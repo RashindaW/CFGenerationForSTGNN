@@ -36,6 +36,7 @@ python train.py --mode test --checkpoint checkpoints/<timestamp>_<model>_<datase
 - `--model`: `stgcn` or `graphwavenet`
 - `--dataset`: `METRLA` or `PEMSBAY`
 - `--lag` / `--horizon`: historical context and forecast length
+- `--gpus`: comma-separated CUDA IDs (e.g., `0,1,2,3`). When multiple IDs are provided the training script automatically launches DistributedDataParallel workers across those devices.
 - `--checkpoint_dir`: directory where training runs are stored (defaults to `checkpoints`)
 - `--checkpoint`: path to a saved checkpoint when running in `test` mode
 - `--output`: explicit checkpoint filepath; overrides the directory layout when provided
