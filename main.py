@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import shlex
+import sys
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -90,6 +93,10 @@ def add_diffusion_subcommand(subparsers: argparse._SubParsersAction[argparse.Arg
     parser.add_argument("--diffusion_time_dim", type=int, default=256)
     parser.add_argument("--diffusion_dropout", type=float, default=0.1)
     parser.add_argument("--loss_type", type=str, choices=["l1", "l2"], default="l2")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping threshold.")
+    parser.add_argument("--use_ema", action="store_true", default=True, help="Use EMA for model parameters.")
+    parser.add_argument("--no_ema", action="store_false", dest="use_ema", help="Disable EMA.")
+    parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate.")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/diffusion")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default=None, help="Resume training from a checkpoint.")
@@ -122,6 +129,61 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
     parser.add_argument("--gpus", type=str, default=None, help="Comma-separated CUDA device IDs, e.g., '0,1'.")
     parser.add_argument("--output_path", type=str, default="counterfactual_samples.pt")
     parser.add_argument("--warm_start", action="store_true", help="Warm-start guidance from the observed trajectory.")
+    parser.add_argument("--use_predicted_target", action="store_true", help="Use the forecaster's prediction as the guidance target.")
+    parser.add_argument(
+        "--target_adjust_percent",
+        type=float,
+        default=0.0,
+        help="Percentage change to apply to the final horizon step of the selected node's target.",
+    )
+    parser.add_argument(
+        "--target_adjust_offset",
+        type=float,
+        default=0.0,
+        help="Additive offset (DC shift) to apply to the final horizon step of the selected node's target.",
+    )
+    parser.add_argument(
+        "--target_adjust_node",
+        type=int,
+        default=0,
+        help="Node index whose final horizon value is adjusted (use -1 to apply to all nodes).",
+    )
+    parser.add_argument(
+        "--plot_node",
+        type=int,
+        default=None,
+        help="Node index to visualize; defaults to the adjusted node or 0 if unspecified.",
+    )
+    parser.add_argument(
+        "--plot_path",
+        type=str,
+        default=None,
+        help="Optional path to save a plot comparing original and counterfactual predictions.",
+    )
+    parser.add_argument(
+        "--cf_horizon",
+        type=int,
+        default=None,
+        help="Override the number of horizon steps to enforce for counterfactual guidance and plotting.",
+    )
+    parser.add_argument(
+        "--anchor_start_weight",
+        type=float,
+        default=1.0,
+        help="Weight applied to early horizon steps to keep them close to the baseline forecast.",
+    )
+    parser.add_argument(
+        "--anchor_end_weight",
+        type=float,
+        default=0.05,
+        help="Weight applied to the final horizon step for the baseline-anchoring loss.",
+    )
+    parser.add_argument(
+        "--anchor_loss_scale",
+        type=float,
+        default=1.0,
+        help="Overall scale for the baseline anchoring penalty.",
+    )
     parser.set_defaults(handler=run_counterfactual_command)
     return parser
 
@@ -168,6 +230,30 @@ def resolve_diffusion_checkpoint_path(args: argparse.Namespace) -> Path:
     return run_dir / "diffusion.pt"
 
 
+def append_csv_row(csv_path: Path, headers: list[str], values: list[float]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not csv_path.exists()
+    with csv_path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if write_header:
+            writer.writerow(headers)
+        writer.writerow(values)
+
+
+def _format_training_command() -> str:
+    python_exec = sys.executable or "python"
+    try:
+        arg_string = shlex.join(sys.argv)
+    except AttributeError:
+        arg_string = " ".join(shlex.quote(arg) for arg in sys.argv)
+    return f"{python_exec} {arg_string}".strip()
+
+
+def write_training_command_file(directory: Path) -> None:
+    command_path = directory / "trainingCommand.txt"
+    command_path.write_text(_format_training_command() + "\n")
+
+
 def save_diffusion_checkpoint(
     path: Path,
     epoch: int,
@@ -177,6 +263,7 @@ def save_diffusion_checkpoint(
     dataset_meta: Dict[str, Any],
     model_meta: Dict[str, Any],
     metrics: Dict[str, float],
+    ema_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     checkpoint = {
         "epoch": epoch,
@@ -187,6 +274,8 @@ def save_diffusion_checkpoint(
         "model_meta": model_meta,
         "metrics": metrics,
     }
+    if ema_state is not None:
+        checkpoint["ema_state"] = ema_state
     torch.save(checkpoint, path)
 
 
@@ -226,7 +315,7 @@ def run_diffusion_command(args: argparse.Namespace) -> None:
         val_ratio=args.val_ratio,
         target_channel=args.target_channel,
     )
-    loaders = build_dataloaders(bundle, args.batch_size, args.num_workers)
+    loaders, _ = build_dataloaders(bundle, args.batch_size, args.num_workers)
 
     network = SpatioTemporalUNet(
         in_channels=bundle.num_features,
@@ -245,9 +334,14 @@ def run_diffusion_command(args: argparse.Namespace) -> None:
         device,
         bundle.adjacency.to(device),
         temporal_context=build_temporal_context(args.lag, device),
+        grad_clip=args.grad_clip,
+        use_ema=args.use_ema,
+        ema_decay=args.ema_decay,
     )
 
     checkpoint_path = resolve_diffusion_checkpoint_path(args)
+    write_training_command_file(checkpoint_path.parent)
+    metrics_csv = checkpoint_path.parent / "metrics.csv"
     best_val = float("inf")
     start_epoch = 1
     if args.checkpoint:
@@ -256,12 +350,23 @@ def run_diffusion_command(args: argparse.Namespace) -> None:
         optimizer.load_state_dict(ckpt["optimizer_state"])
         start_epoch = ckpt.get("epoch", 0) + 1
         best_val = ckpt.get("metrics", {}).get("val_loss", best_val)
-        print(f"Resumed diffusion training from {args.checkpoint} at epoch {start_epoch}")
+        
+        # Load EMA state if available
+        if trainer.ema is not None and "ema_state" in ckpt:
+            trainer.ema.load_state_dict(ckpt["ema_state"])
+            print(f"Resumed diffusion training with EMA from {args.checkpoint} at epoch {start_epoch}")
+        else:
+            print(f"Resumed diffusion training from {args.checkpoint} at epoch {start_epoch}")
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_loss = trainer.train_epoch(loaders["train"])
         val_loss = trainer.evaluate_epoch(loaders["val"])
         print(f"[Diffusion] Epoch {epoch:03d} | Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f}")
+        append_csv_row(
+            metrics_csv,
+            ["epoch", "train_loss", "val_loss"],
+            [epoch, train_loss, val_loss],
+        )
         if val_loss < best_val:
             best_val = val_loss
             dataset_meta = {
@@ -283,7 +388,8 @@ def run_diffusion_command(args: argparse.Namespace) -> None:
                 "dropout": args.diffusion_dropout,
             }
             metrics = {"train_loss": train_loss, "val_loss": val_loss}
-            save_diffusion_checkpoint(checkpoint_path, epoch, diffusion, optimizer, diffusion_config, dataset_meta, model_meta, metrics)
+            ema_state = trainer.ema.state_dict() if trainer.ema is not None else None
+            save_diffusion_checkpoint(checkpoint_path, epoch, diffusion, optimizer, diffusion_config, dataset_meta, model_meta, metrics, ema_state)
             print(f"Saved best diffusion checkpoint to {checkpoint_path}")
 
 
@@ -305,6 +411,122 @@ def prepare_target(default_target: torch.Tensor, path: Optional[str]) -> torch.T
     if tensor.shape != default_target.shape:
         raise ValueError(f"Target shape {tensor.shape} does not match expected {default_target.shape}")
     return tensor
+
+
+def adjust_target(
+    target: torch.Tensor,
+    percent: float,
+    offset: float,
+    node_index: int,
+) -> torch.Tensor:
+    adjusted = target.clone()
+    if adjusted.shape[1] == 0:
+        return adjusted
+    indices: torch.Tensor | slice
+    if node_index < 0:
+        indices = slice(None)
+    elif node_index >= adjusted.shape[0]:
+        raise ValueError(f"target_adjust_node {node_index} is out of range for {adjusted.shape[0]} nodes")
+    else:
+        indices = node_index
+    if percent != 0.0:
+        factor = 1.0 + percent / 100.0
+        adjusted[indices, -1] = adjusted[indices, -1] * factor
+    if offset != 0.0:
+        adjusted[indices, -1] = adjusted[indices, -1] + offset
+    return adjusted
+
+
+def build_guidance_target(
+    baseline: torch.Tensor,
+    adjusted_target: torch.Tensor,
+    node_index: int,
+) -> torch.Tensor:
+    if baseline.shape != adjusted_target.shape:
+        raise ValueError("baseline and adjusted target must share the same shape")
+    horizon = baseline.shape[1]
+    if horizon == 0:
+        return baseline.clone()
+    guidance = baseline.clone()
+    ramp = torch.linspace(0.0, 1.0, steps=horizon, dtype=baseline.dtype, device=baseline.device)
+    if node_index < 0:
+        node_idx = torch.arange(baseline.shape[0], dtype=torch.long)
+    elif node_index >= baseline.shape[0]:
+        raise ValueError(f"target_adjust_node {node_index} is out of range for {baseline.shape[0]} nodes")
+    else:
+        node_idx = torch.tensor([node_index], dtype=torch.long)
+    if node_idx.numel() == 0:
+        return guidance
+    delta = adjusted_target[node_idx, -1] - baseline[node_idx, -1]
+    guidance[node_idx] = baseline[node_idx] + delta.unsqueeze(1) * ramp
+    guidance[node_idx, -1] = adjusted_target[node_idx, -1]
+    return guidance
+
+
+def truncate_horizon(tensor: torch.Tensor, horizon: Optional[int]) -> torch.Tensor:
+    if horizon is None or tensor.shape[1] <= horizon:
+        return tensor
+    if horizon <= 0:
+        raise ValueError("cf_horizon must be positive")
+    return tensor[:, :horizon].contiguous()
+
+
+def save_prediction_plot(
+    plot_path: Path,
+    node_index: int,
+    original_prediction: torch.Tensor,
+    cf_prediction: torch.Tensor,
+    adjusted_target: torch.Tensor,
+    ground_truth: torch.Tensor,
+    guidance_target: Optional[torch.Tensor] = None,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib is not available; skipping plot generation.")
+        return
+
+    node_index = max(0, min(node_index, original_prediction.shape[0] - 1))
+    horizon = original_prediction.shape[1]
+    steps = list(range(horizon))
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(8, 4))
+    plt.plot(steps, original_prediction[node_index].detach().cpu().numpy(), label="Original forecast", linewidth=2)
+    plt.plot(
+        steps,
+        cf_prediction[node_index].detach().cpu().numpy(),
+        label="Counterfactual forecast (best)",
+        linestyle="--",
+        linewidth=2,
+    )
+    plt.plot(
+        steps,
+        ground_truth[node_index].detach().cpu().numpy(),
+        label="Ground truth",
+        linestyle=":",
+        linewidth=2,
+    )
+    if guidance_target is not None:
+        plt.plot(
+            steps,
+            guidance_target[node_index].detach().cpu().numpy(),
+            label="Guidance target",
+            linestyle="-.",
+            linewidth=2,
+        )
+    plt.scatter(
+        [horizon - 1],
+        [adjusted_target[node_index, -1].detach().cpu().item()],
+        label="Adjusted target (final step)",
+        color="red",
+    )
+    plt.title(f"Node {node_index} horizon forecast comparison")
+    plt.xlabel("Horizon step")
+    plt.ylabel("Value")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(plot_path)
+    plt.close()
 
 
 def select_split_dataset(bundle: TemporalDatasetBundle, split: str):
@@ -367,18 +589,54 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
     if dataset_info.get("dataset") and dataset_info.get("dataset") != dataset_meta["dataset"]:
         print("Warning: Forecaster and diffusion checkpoints were trained on different datasets.")
 
+    dataset_horizon = dataset_meta["horizon"]
+    cf_horizon = args.cf_horizon if args.cf_horizon is not None else dataset_horizon
+    if cf_horizon <= 0:
+        raise ValueError("cf_horizon must be positive")
+    if cf_horizon > dataset_horizon:
+        raise ValueError(f"cf_horizon {cf_horizon} exceeds dataset horizon {dataset_horizon}")
+
     split_dataset = select_split_dataset(bundle, args.split)
     if args.sample_index < 0 or args.sample_index >= len(split_dataset):
         raise ValueError(f"sample_index {args.sample_index} is out of range for split {args.split}")
     past_window, target_future = split_dataset[args.sample_index]
-    target_future = target_future.permute(1, 0).contiguous()
+    past_window = past_window.float()
+    target_future = target_future.permute(1, 0).contiguous().float()
 
-    target_tensor = prepare_target(target_future, args.target_path)
+    default_target = truncate_horizon(prepare_target(target_future, args.target_path).float(), cf_horizon)
+    past_window_batch = past_window.unsqueeze(0).to(device).float()
+    with torch.no_grad():
+        baseline_forecast = (
+            forecaster(prepare_forecaster_input(past_window_batch))
+            .squeeze(0)
+            .detach()
+            .cpu()
+            .float()
+        )
+    baseline_forecast = truncate_horizon(baseline_forecast, cf_horizon)
+
+    anchor_start = max(args.anchor_start_weight, 0.0)
+    anchor_end = max(args.anchor_end_weight, 0.0)
+    anchor_weights = torch.linspace(anchor_start, anchor_end, steps=cf_horizon, dtype=torch.float32)
+
+    if args.use_predicted_target:
+        target_source = baseline_forecast.clone()
+    else:
+        target_source = default_target.clone()
+
+    adjusted_target = truncate_horizon(
+        adjust_target(target_source, args.target_adjust_percent, args.target_adjust_offset, args.target_adjust_node).float(),
+        cf_horizon,
+    )
+    if args.target_path is not None:
+        guidance_target = adjusted_target.clone()
+    else:
+        guidance_target = build_guidance_target(baseline_forecast, adjusted_target, args.target_adjust_node)
     mask = prepare_mask(past_window.shape[0], bundle.num_nodes, bundle.num_features, args.mask_path)
 
     sample_shape = torch.Size(past_window.shape)  # (T, N, F)
     mask = mask.to(device)
-    target_batched = target_tensor.unsqueeze(0).repeat(args.samples, 1, 1).to(device)
+    target_batched = guidance_target.unsqueeze(0).repeat(args.samples, 1, 1).to(device)
     mask_batched = mask.unsqueeze(0).repeat(args.samples, 1, 1, 1).to(device)
 
     guidance_config = GuidanceConfig(
@@ -390,6 +648,9 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         rate_limit=args.rate_limit,
         clamp_min=args.clamp_min,
         clamp_max=args.clamp_max,
+        anchor_start_weight=args.anchor_start_weight,
+        anchor_end_weight=args.anchor_end_weight,
+        anchor_loss_scale=args.anchor_loss_scale,
     )
     guidance = ForecastGuidance(
         forecaster=forecaster,
@@ -399,6 +660,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         config=guidance_config,
         lower_bounds=args.lower_bound,
         upper_bounds=args.upper_bound,
+        baseline=baseline_forecast,
+        anchor_weights=anchor_weights,
     )
 
     generator = CounterfactualGenerator(
@@ -422,8 +685,27 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
 
     with torch.no_grad():
         cf_preds = forecaster(prepare_forecaster_input(samples))
+        cf_preds = cf_preds[:, :, :cf_horizon]
         mse = torch.mean((cf_preds - target_batched) ** 2, dim=(1, 2))
         print(f"Counterfactual guidance MSE per sample: {mse.cpu().numpy()}")
+
+    cf_preds_cpu = cf_preds.detach().cpu().float()
+    mse_cpu = mse.detach().cpu()
+    best_idx = int(torch.argmin(mse_cpu).item())
+    best_cf_prediction = cf_preds_cpu[best_idx]
+
+    plot_node = args.plot_node if args.plot_node is not None else (args.target_adjust_node if args.target_adjust_node >= 0 else 0)
+    plot_path = Path(args.plot_path) if args.plot_path else Path(args.output_path).with_name(Path(args.output_path).stem + "_plot.png")
+    if adjusted_target.shape[0] > 0 and adjusted_target.shape[1] > 0:
+        save_prediction_plot(
+            plot_path,
+            plot_node,
+            baseline_forecast,
+            best_cf_prediction,
+            adjusted_target,
+            default_target,
+            guidance_target,
+        )
 
     output = {
         "samples": samples.cpu(),
@@ -438,6 +720,20 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             "split": args.split,
             "sample_index": args.sample_index,
         },
+        "baseline_forecast": baseline_forecast,
+        "original_target": default_target,
+        "adjusted_target": adjusted_target,
+        "target_adjust_percent": args.target_adjust_percent,
+        "target_adjust_offset": args.target_adjust_offset,
+        "target_adjust_node": args.target_adjust_node,
+        "use_predicted_target": args.use_predicted_target,
+        "plot_path": str(plot_path),
+        "counterfactual_mse": mse_cpu,
+        "best_sample_index": best_idx,
+        "best_counterfactual_prediction": best_cf_prediction,
+        "cf_horizon": cf_horizon,
+        "anchor_weights": anchor_weights,
+        "guidance_target": guidance_target,
     }
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

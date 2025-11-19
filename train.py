@@ -1,6 +1,7 @@
 from __future__ import annotations
 import tqdm
 import argparse
+import csv
 from dataclasses import asdict
 import math
 import os
@@ -102,6 +103,16 @@ def cleanup_distributed() -> None:
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
+
+
+def append_metrics_row(csv_path: Path, headers: List[str], values: List[float]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = csv_path.exists()
+    with csv_path.open("a", newline="") as handle:
+        writer = csv.writer(handle)
+        if not file_exists:
+            writer.writerow(headers)
+        writer.writerow(values)
 
 
 def sym_normalized_adjacency(adj: torch.Tensor) -> torch.Tensor:
@@ -373,6 +384,7 @@ def train_pipeline(args: argparse.Namespace) -> None:
     run_dir, checkpoint_path = resolve_checkpoint_destination(args)
     args.resolved_run_dir = str(run_dir)
     args.resolved_checkpoint_path = str(checkpoint_path)
+    args.metrics_csv_path = str(run_dir / "metrics.csv")
     if gpu_ids and len(gpu_ids) > 1:
         world_size = len(gpu_ids)
         mp.spawn(train_worker, args=(args, gpu_ids, True), nprocs=world_size, join=True)
@@ -483,6 +495,7 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
 
     run_dir = Path(getattr(args, "resolved_run_dir"))
     checkpoint_path = Path(getattr(args, "resolved_checkpoint_path"))
+    metrics_path = Path(getattr(args, "metrics_csv_path"))
     if rank == 0:
         print(f"Saving checkpoints under {run_dir}")
 
@@ -517,6 +530,19 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
                 f"Epoch {epoch:03d} | "
                 f"Train Loss: {train_stats['loss']:.4f} MAE: {train_stats['mae']:.4f} RMSE: {train_stats['rmse']:.4f} | "
                 f"Val Loss: {val_stats['loss']:.4f} MAE: {val_stats['mae']:.4f} RMSE: {val_stats['rmse']:.4f}"
+            )
+            append_metrics_row(
+                metrics_path,
+                ["epoch", "train_loss", "train_mae", "train_rmse", "val_loss", "val_mae", "val_rmse"],
+                [
+                    epoch,
+                    train_stats["loss"],
+                    train_stats["mae"],
+                    train_stats["rmse"],
+                    val_stats["loss"],
+                    val_stats["mae"],
+                    val_stats["rmse"],
+                ],
             )
             if val_stats["loss"] < best_val_loss:
                 best_val_loss = val_stats["loss"]

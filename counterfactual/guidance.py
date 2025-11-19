@@ -72,6 +72,8 @@ class ForecastGuidance:
         config: GuidanceConfig,
         lower_bounds: Optional[torch.Tensor | float] = None,
         upper_bounds: Optional[torch.Tensor | float] = None,
+        baseline: Optional[torch.Tensor] = None,
+        anchor_weights: Optional[torch.Tensor] = None,
     ) -> None:
         device = next(forecaster.parameters()).device
         self.forecaster = forecaster
@@ -82,6 +84,12 @@ class ForecastGuidance:
         self.laplacian = compute_graph_laplacian(self.adjacency)
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds
+        self.baseline = baseline.to(device).float().unsqueeze(0) if baseline is not None else None
+        if anchor_weights is not None:
+            weights = anchor_weights.to(device).float().view(1, 1, -1)
+        else:
+            weights = None
+        self.anchor_weights = weights
 
         self.forecaster.eval()
 
@@ -113,6 +121,14 @@ class ForecastGuidance:
             x.requires_grad_(True)
             prediction = self.forecaster(prepare_forecaster_input(x))
             loss = F.mse_loss(prediction, self.target)
+            if (
+                self.baseline is not None
+                and self.anchor_weights is not None
+                and self.config.anchor_loss_scale > 0
+            ):
+                anchor_term = (prediction - self.baseline).pow(2)
+                anchor_term = anchor_term * self.anchor_weights
+                loss = loss + self.config.anchor_loss_scale * anchor_term.mean()
             if self.config.temporal_weight > 0:
                 loss = loss + self.config.temporal_weight * temporal_smoothness(x, self.mask)
             if self.config.spatial_weight > 0:

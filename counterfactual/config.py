@@ -33,6 +33,9 @@ class GuidanceConfig:
     clamp_max: Optional[float] = None
     mask_strategy: str = "controls_only"
     max_grad_norm: Optional[float] = 10.0
+    anchor_start_weight: float = 1.0
+    anchor_end_weight: float = 0.1
+    anchor_loss_scale: float = 1.0
 
 
 @dataclass
