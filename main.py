@@ -184,6 +184,12 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         default=1.0,
         help="Overall scale for the baseline anchoring penalty.",
     )
+    parser.add_argument(
+        "--anchor_release_power",
+        type=float,
+        default=1.5,
+        help="Exponent that shapes how quickly anchor weights decay toward the horizon (values > 1 hold longer).",
+    )
     parser.set_defaults(handler=run_counterfactual_command)
     return parser
 
@@ -463,6 +469,34 @@ def build_guidance_target(
     return guidance
 
 
+def build_anchor_weights(
+    baseline: torch.Tensor,
+    guidance_target: torch.Tensor,
+    start_weight: float,
+    end_weight: float,
+    release_power: float,
+) -> torch.Tensor:
+    if baseline.shape != guidance_target.shape:
+        raise ValueError("baseline and guidance_target must share the same shape for anchor weighting")
+    horizon = baseline.shape[1]
+    start = max(start_weight, 0.0)
+    end = max(end_weight, 0.0)
+    if horizon == 0:
+        return torch.zeros(0, dtype=torch.float32)
+    release_power = max(float(release_power), 1e-3)
+    per_step_delta = (guidance_target - baseline).abs().amax(dim=0)
+    max_delta_value = float(per_step_delta.max().item())
+    if max_delta_value <= 1e-8:
+        progress = torch.linspace(0.0, 1.0, steps=horizon, dtype=torch.float32)
+    else:
+        progress = (per_step_delta / max_delta_value).clamp(0.0, 1.0)
+    progress = progress.to(torch.float32).pow(release_power)
+    start_tensor = torch.full_like(progress, start)
+    end_tensor = torch.full_like(progress, end)
+    weights = torch.lerp(start_tensor, end_tensor, progress)
+    return weights.clamp_min(0.0)
+
+
 def truncate_horizon(tensor: torch.Tensor, horizon: Optional[int]) -> torch.Tensor:
     if horizon is None or tensor.shape[1] <= horizon:
         return tensor
@@ -615,10 +649,6 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         )
     baseline_forecast = truncate_horizon(baseline_forecast, cf_horizon)
 
-    anchor_start = max(args.anchor_start_weight, 0.0)
-    anchor_end = max(args.anchor_end_weight, 0.0)
-    anchor_weights = torch.linspace(anchor_start, anchor_end, steps=cf_horizon, dtype=torch.float32)
-
     if args.use_predicted_target:
         target_source = baseline_forecast.clone()
     else:
@@ -632,6 +662,18 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         guidance_target = adjusted_target.clone()
     else:
         guidance_target = build_guidance_target(baseline_forecast, adjusted_target, args.target_adjust_node)
+    anchor_start = max(args.anchor_start_weight, 0.0)
+    anchor_end = max(args.anchor_end_weight, 0.0)
+    if guidance_target is not None:
+        anchor_weights = build_anchor_weights(
+            baseline_forecast,
+            guidance_target,
+            anchor_start,
+            anchor_end,
+            args.anchor_release_power,
+        )
+    else:
+        anchor_weights = torch.linspace(anchor_start, anchor_end, steps=cf_horizon, dtype=torch.float32)
     mask = prepare_mask(past_window.shape[0], bundle.num_nodes, bundle.num_features, args.mask_path)
 
     sample_shape = torch.Size(past_window.shape)  # (T, N, F)
@@ -733,6 +775,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         "best_counterfactual_prediction": best_cf_prediction,
         "cf_horizon": cf_horizon,
         "anchor_weights": anchor_weights,
+        "anchor_release_power": args.anchor_release_power,
         "guidance_target": guidance_target,
     }
     output_path = Path(args.output_path)
