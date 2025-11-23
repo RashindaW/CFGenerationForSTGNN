@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .config import GuidanceConfig
+from train import forward_pass
 
 
 def prepare_forecaster_input(x: torch.Tensor) -> torch.Tensor:
@@ -74,6 +75,7 @@ class ForecastGuidance:
         upper_bounds: Optional[torch.Tensor | float] = None,
         baseline: Optional[torch.Tensor] = None,
         anchor_weights: Optional[torch.Tensor] = None,
+        model_type: str = "stgcn",
     ) -> None:
         device = next(forecaster.parameters()).device
         self.forecaster = forecaster
@@ -85,6 +87,7 @@ class ForecastGuidance:
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds
         self.baseline = baseline.to(device).float().unsqueeze(0) if baseline is not None else None
+        self.model_type = model_type
         if anchor_weights is not None:
             weights = anchor_weights.to(device).float().view(1, 1, -1)
         else:
@@ -119,7 +122,8 @@ class ForecastGuidance:
         with torch.enable_grad():
             x = x.detach()
             x.requires_grad_(True)
-            prediction = self.forecaster(prepare_forecaster_input(x))
+            forecaster_input = prepare_forecaster_input(x)
+            prediction = forward_pass(self.forecaster, forecaster_input, self.model_type)
             loss = F.mse_loss(prediction, self.target)
             if (
                 self.baseline is not None

@@ -450,22 +450,34 @@ def build_guidance_target(
 ) -> torch.Tensor:
     if baseline.shape != adjusted_target.shape:
         raise ValueError("baseline and adjusted target must share the same shape")
-    horizon = baseline.shape[1]
+    if baseline.dim() == 2:
+        base = baseline
+        target = adjusted_target
+    elif baseline.dim() == 3 and baseline.size(-1) == 1:
+        base = baseline.squeeze(-1)
+        target = adjusted_target.squeeze(-1)
+    else:
+        raise ValueError("baseline/target must have shape (nodes, horizon) or (nodes, horizon, 1)")
+    horizon = base.shape[1]
     if horizon == 0:
         return baseline.clone()
-    guidance = baseline.clone()
-    ramp = torch.linspace(0.0, 1.0, steps=horizon, dtype=baseline.dtype, device=baseline.device)
+    guidance = base.clone()
+    ramp = torch.linspace(0.0, 1.0, steps=horizon, dtype=base.dtype, device=base.device)
     if node_index < 0:
-        node_idx = torch.arange(baseline.shape[0], dtype=torch.long)
-    elif node_index >= baseline.shape[0]:
-        raise ValueError(f"target_adjust_node {node_index} is out of range for {baseline.shape[0]} nodes")
+        node_idx = torch.arange(base.shape[0], dtype=torch.long, device=base.device)
+    elif node_index >= base.shape[0]:
+        raise ValueError(f"target_adjust_node {node_index} is out of range for {base.shape[0]} nodes")
     else:
-        node_idx = torch.tensor([node_index], dtype=torch.long)
+        node_idx = torch.tensor([node_index], dtype=torch.long, device=base.device)
     if node_idx.numel() == 0:
-        return guidance
-    delta = adjusted_target[node_idx, -1] - baseline[node_idx, -1]
-    guidance[node_idx] = baseline[node_idx] + delta.unsqueeze(1) * ramp
-    guidance[node_idx, -1] = adjusted_target[node_idx, -1]
+        return baseline.clone()
+
+    delta = target[node_idx, -1] - base[node_idx, -1]
+    guidance[node_idx] = base[node_idx] + delta.unsqueeze(1) * ramp
+    guidance[node_idx, -1] = target[node_idx, -1]
+
+    if baseline.dim() == 3:
+        guidance = guidance.unsqueeze(-1)
     return guidance
 
 
@@ -522,7 +534,7 @@ def save_prediction_plot(
 
     node_index = max(0, min(node_index, original_prediction.shape[0] - 1))
     horizon = original_prediction.shape[1]
-    steps = list(range(horizon))
+    steps = list(range(1, horizon + 1))
     plot_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(8, 4))
     plt.plot(steps, original_prediction[node_index].detach().cpu().numpy(), label="Original forecast", linewidth=2)
@@ -549,7 +561,7 @@ def save_prediction_plot(
             linewidth=2,
         )
     plt.scatter(
-        [horizon - 1],
+        [horizon],
         [adjusted_target[node_index, -1].detach().cpu().item()],
         label="Adjusted target (final step)",
         color="red",
@@ -577,6 +589,7 @@ def load_forecaster_from_checkpoint(path: Path, device: torch.device, data_root_
 
     dataset_name = checkpoint.get("dataset") or checkpoint_args.get("dataset")
     dataset_name = dataset_name.upper() if dataset_name else "METRLA"
+    model_type = checkpoint_args.get("model", "stgcn")
     lag = checkpoint_args.get("lag", 12)
     horizon = checkpoint_args.get("horizon", 12)
     train_ratio = checkpoint_args.get("train_ratio", 0.7)
@@ -605,6 +618,7 @@ def load_forecaster_from_checkpoint(path: Path, device: torch.device, data_root_
         "horizon": horizon,
         "dataset": dataset_name,
         "target_channel": target_channel,
+        "model": model_type,
     }
     return model, bundle, metadata
 
@@ -617,6 +631,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
     forecaster, bundle, dataset_meta = load_forecaster_from_checkpoint(
         forecaster_path, device, Path(args.data_root) if args.data_root else None
     )
+    model_type = dataset_meta.get("model", "stgcn")
 
     diffusion, diffusion_ckpt = load_diffusion_checkpoint(diffusion_path, device, gpu_ids=args.gpu_ids)
     dataset_info = diffusion_ckpt.get("dataset_meta", {})
@@ -639,9 +654,10 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
 
     default_target = truncate_horizon(prepare_target(target_future, args.target_path).float(), cf_horizon)
     past_window_batch = past_window.unsqueeze(0).to(device).float()
+    forecaster_input = prepare_forecaster_input(past_window_batch)
     with torch.no_grad():
         baseline_forecast = (
-            forecaster(prepare_forecaster_input(past_window_batch))
+            forecaster_module.forward_pass(forecaster, forecaster_input, model_type)
             .squeeze(0)
             .detach()
             .cpu()
@@ -704,6 +720,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         upper_bounds=args.upper_bound,
         baseline=baseline_forecast,
         anchor_weights=anchor_weights,
+        model_type=model_type,
     )
 
     generator = CounterfactualGenerator(
@@ -726,7 +743,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
     )
 
     with torch.no_grad():
-        cf_preds = forecaster(prepare_forecaster_input(samples))
+        cf_input = prepare_forecaster_input(samples)
+        cf_preds = forecaster_module.forward_pass(forecaster, cf_input, model_type)
         cf_preds = cf_preds[:, :, :cf_horizon]
         mse = torch.mean((cf_preds - target_batched) ** 2, dim=(1, 2))
         print(f"Counterfactual guidance MSE per sample: {mse.cpu().numpy()}")
