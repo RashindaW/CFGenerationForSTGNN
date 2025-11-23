@@ -161,6 +161,20 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         help="Optional path to save a plot comparing original and counterfactual predictions.",
     )
     parser.add_argument(
+        "--guidance_start_source",
+        type=str,
+        choices=["baseline", "ground_truth", "lag"],
+        default="baseline",
+        help="Select the starting point for the guidance trajectory interpolation.",
+    )
+    parser.add_argument(
+        "--guidance_interpolation",
+        type=str,
+        choices=["linear"],
+        default="linear",
+        help="Interpolation scheme for guidance trajectory (last point is always fixed).",
+    )
+    parser.add_argument(
         "--cf_horizon",
         type=int,
         default=None,
@@ -447,6 +461,11 @@ def build_guidance_target(
     baseline: torch.Tensor,
     adjusted_target: torch.Tensor,
     node_index: int,
+    start_source: str = "baseline",
+    start_target: Optional[torch.Tensor] = None,
+    interpolation: str = "linear",
+    lag_start: Optional[torch.Tensor] = None,
+    lag_length: int = 0,
 ) -> torch.Tensor:
     if baseline.shape != adjusted_target.shape:
         raise ValueError("baseline and adjusted target must share the same shape")
@@ -462,7 +481,11 @@ def build_guidance_target(
     if horizon == 0:
         return baseline.clone()
     guidance = base.clone()
-    ramp = torch.linspace(0.0, 1.0, steps=horizon, dtype=base.dtype, device=base.device)
+    ramp_steps = horizon
+    if start_source == "lag":
+        ramp_steps = max(lag_length + horizon, horizon)
+    ramp_full = torch.linspace(0.0, 1.0, steps=ramp_steps, dtype=base.dtype, device=base.device)
+    ramp = ramp_full[-horizon:]
     if node_index < 0:
         node_idx = torch.arange(base.shape[0], dtype=torch.long, device=base.device)
     elif node_index >= base.shape[0]:
@@ -472,9 +495,26 @@ def build_guidance_target(
     if node_idx.numel() == 0:
         return baseline.clone()
 
-    delta = target[node_idx, -1] - base[node_idx, -1]
-    guidance[node_idx] = base[node_idx] + delta.unsqueeze(1) * ramp
-    guidance[node_idx, -1] = target[node_idx, -1]
+    if start_source == "ground_truth":
+        if start_target is None or start_target.shape != base.shape:
+            raise ValueError("start_target must be provided with matching shape when start_source='ground_truth'")
+        start_values = start_target[node_idx, 0]
+    elif start_source == "lag":
+        if lag_start is None or lag_start.shape[0] != base.shape[0]:
+            raise ValueError("lag_start must be provided with shape (nodes,) when start_source='lag'")
+        start_values = lag_start[node_idx]
+    elif start_source == "baseline":
+        start_values = base[node_idx, 0]
+    else:
+        raise ValueError(f"Unknown start_source {start_source}")
+
+    end_values = target[node_idx, -1]
+    if interpolation == "linear":
+        guidance[node_idx] = start_values.unsqueeze(1) + (end_values - start_values).unsqueeze(1) * ramp
+    else:
+        raise ValueError(f"Unknown interpolation {interpolation}")
+
+    guidance[node_idx, -1] = end_values
 
     if baseline.dim() == 3:
         guidance = guidance.unsqueeze(-1)
@@ -525,6 +565,7 @@ def save_prediction_plot(
     adjusted_target: torch.Tensor,
     ground_truth: torch.Tensor,
     guidance_target: Optional[torch.Tensor] = None,
+    lag_target: Optional[torch.Tensor] = None,
 ) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -535,6 +576,12 @@ def save_prediction_plot(
     node_index = max(0, min(node_index, original_prediction.shape[0] - 1))
     horizon = original_prediction.shape[1]
     steps = list(range(1, horizon + 1))
+    lag_steps: list[int] = []
+    lag_values = None
+    if lag_target is not None and lag_target.dim() == 2 and lag_target.shape[0] > node_index:
+        lag_values = lag_target[node_index].detach().cpu().numpy()
+        lag_steps = list(range(-lag_target.shape[1] + 1, 1))
+
     plot_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(8, 4))
     plt.plot(steps, original_prediction[node_index].detach().cpu().numpy(), label="Original forecast", linewidth=2)
@@ -545,13 +592,13 @@ def save_prediction_plot(
         linestyle="--",
         linewidth=2,
     )
-    plt.plot(
-        steps,
-        ground_truth[node_index].detach().cpu().numpy(),
-        label="Ground truth",
-        linestyle=":",
-        linewidth=2,
-    )
+    if lag_values is not None:
+        gt_steps = lag_steps + steps
+        gt_values = np.concatenate([lag_values, ground_truth[node_index].detach().cpu().numpy()])
+    else:
+        gt_steps = steps
+        gt_values = ground_truth[node_index].detach().cpu().numpy()
+    plt.plot(gt_steps, gt_values, label="Ground truth", linestyle=":", linewidth=2)
     if guidance_target is not None:
         plt.plot(
             steps,
@@ -674,10 +721,28 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         adjust_target(target_source, args.target_adjust_percent, args.target_adjust_offset, args.target_adjust_node).float(),
         cf_horizon,
     )
+    lag_start = None
+    if args.guidance_start_source == "lag":
+        target_ch = dataset_meta.get("target_channel", 0)
+        if target_ch < 0 or target_ch >= past_window.shape[-1]:
+            raise ValueError(f"target_channel {target_ch} is out of range for past window features {past_window.shape[-1]}")
+        lag_start = past_window[:, :, target_ch].float()[0]
+        lag_length = past_window.shape[0]
+    else:
+        lag_length = past_window.shape[0]
     if args.target_path is not None:
         guidance_target = adjusted_target.clone()
     else:
-        guidance_target = build_guidance_target(baseline_forecast, adjusted_target, args.target_adjust_node)
+        guidance_target = build_guidance_target(
+            baseline_forecast,
+            adjusted_target,
+            args.target_adjust_node,
+            start_source=args.guidance_start_source,
+            start_target=default_target,
+            interpolation=args.guidance_interpolation,
+            lag_start=lag_start,
+            lag_length=lag_length,
+        )
     anchor_start = max(args.anchor_start_weight, 0.0)
     anchor_end = max(args.anchor_end_weight, 0.0)
     if guidance_target is not None:
@@ -756,6 +821,10 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
 
     plot_node = args.plot_node if args.plot_node is not None else (args.target_adjust_node if args.target_adjust_node >= 0 else 0)
     plot_path = Path(args.plot_path) if args.plot_path else Path(args.output_path).with_name(Path(args.output_path).stem + "_plot.png")
+    target_ch = dataset_meta.get("target_channel", 0)
+    lag_target = None
+    if 0 <= target_ch < past_window.shape[-1]:
+        lag_target = past_window[:, :, target_ch].permute(1, 0).contiguous()
     if adjusted_target.shape[0] > 0 and adjusted_target.shape[1] > 0:
         save_prediction_plot(
             plot_path,
@@ -765,6 +834,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             adjusted_target,
             default_target,
             guidance_target,
+            lag_target=lag_target,
         )
 
     output = {
