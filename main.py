@@ -160,6 +160,12 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         help="Node index whose final horizon value is adjusted (use -1 to apply to all nodes).",
     )
     parser.add_argument(
+        "--target_focus_percent",
+        type=float,
+        default=80.0,
+        help="Percentage of forecast loss weight given to the adjusted node; remaining weight is distributed to other nodes by inverse hop distance.",
+    )
+    parser.add_argument(
         "--plot_node",
         type=int,
         default=None,
@@ -584,6 +590,49 @@ def build_anchor_weights(
     return weights.clamp_min(0.0)
 
 
+def compute_hop_node_weights(adjacency: torch.Tensor, target_node: int, focus_percent: float) -> torch.Tensor:
+    """Distribute node weights: target gets focus_percent, others share the remainder by inverse hop distance."""
+
+    if adjacency.dim() == 3:
+        adjacency = adjacency[0]
+    num_nodes = adjacency.shape[0]
+    if target_node < 0 or target_node >= num_nodes:
+        raise ValueError(f"target_adjust_node {target_node} is out of range for {num_nodes} nodes")
+
+    target_share = float(max(0.0, min(focus_percent / 100.0, 1.0)))
+    remaining_share = max(0.0, 1.0 - target_share)
+
+    graph = (adjacency.detach().cpu() > 0).to(torch.bool)
+    distances = torch.full((num_nodes,), float("inf"))
+    distances[target_node] = 0.0
+    frontier = [target_node]
+    while frontier:
+        next_frontier: list[int] = []
+        for node in frontier:
+            neighbors = torch.nonzero(graph[node], as_tuple=False).flatten().tolist()
+            for nb in neighbors:
+                if not torch.isfinite(distances[nb]).item():
+                    distances[nb] = distances[node] + 1.0
+                    next_frontier.append(nb)
+        frontier = next_frontier
+
+    inv_dist = torch.zeros(num_nodes, dtype=torch.float32)
+    reachable_mask = torch.isfinite(distances) & (distances > 0)
+    inv_dist[reachable_mask] = 1.0 / distances[reachable_mask]
+    inv_total = float(inv_dist.sum().item())
+    if inv_total > 0 and remaining_share > 0:
+        inv_dist = inv_dist * (remaining_share / inv_total)
+    else:
+        inv_dist.zero_()
+
+    weights = inv_dist
+    weights[target_node] = target_share
+    total = float(weights.sum().item())
+    if total <= 0:
+        return torch.ones(num_nodes, dtype=torch.float32) / max(num_nodes, 1)
+    return weights / total
+
+
 def truncate_horizon(tensor: torch.Tensor, horizon: Optional[int]) -> torch.Tensor:
     if horizon is None or tensor.shape[1] <= horizon:
         return tensor
@@ -859,6 +908,9 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         )
     else:
         anchor_weights = torch.linspace(anchor_start, anchor_end, steps=cf_horizon, dtype=torch.float32)
+    node_weights = None
+    if args.target_adjust_node >= 0:
+        node_weights = compute_hop_node_weights(bundle.adjacency, args.target_adjust_node, args.target_focus_percent)
     mask = prepare_mask(past_window.shape[0], bundle.num_nodes, bundle.num_features, args.mask_path)
 
     sample_shape = torch.Size(past_window.shape)  # (T, N, F)
@@ -889,6 +941,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         upper_bounds=args.upper_bound,
         baseline=baseline_forecast,
         anchor_weights=anchor_weights,
+        node_weights=node_weights,
         model_type=model_type,
     )
 
@@ -915,8 +968,12 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         cf_input = prepare_forecaster_input(samples)
         cf_preds = forecaster_module.forward_pass(forecaster, cf_input, model_type)
         cf_preds = cf_preds[:, :, :cf_horizon]
-        mse = torch.mean((cf_preds - target_batched) ** 2, dim=(1, 2))
-        print(f"Counterfactual guidance MSE per sample: {mse.cpu().numpy()}")
+        node_w = node_weights.to(device) if node_weights is not None else torch.ones(bundle.num_nodes, device=device)
+        node_w = node_w / node_w.sum().clamp(min=1e-8)
+        diff_sq = (cf_preds - target_batched) ** 2
+        per_node = diff_sq.mean(dim=2)
+        mse = (per_node * node_w.view(1, -1)).sum(dim=1)
+        print(f"Counterfactual guidance weighted MSE per sample: {mse.cpu().numpy()}")
 
     cf_preds_cpu = cf_preds.detach().cpu().float()
     mse_cpu = mse.detach().cpu()
@@ -972,6 +1029,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         "target_adjust_percent": args.target_adjust_percent,
         "target_adjust_offset": args.target_adjust_offset,
         "target_adjust_node": args.target_adjust_node,
+        "target_focus_percent": args.target_focus_percent,
         "use_predicted_target": args.use_predicted_target,
         "plot_path": str(plot_path),
         "top_cf_window_plot_path": str(top_window_plot_path) if top_window_plot_path else None,
@@ -983,6 +1041,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         "anchor_weights": anchor_weights,
         "anchor_release_power": args.anchor_release_power,
         "guidance_target": guidance_target,
+        "node_weights": node_weights.cpu() if node_weights is not None else None,
     }
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -75,6 +75,7 @@ class ForecastGuidance:
         upper_bounds: Optional[torch.Tensor | float] = None,
         baseline: Optional[torch.Tensor] = None,
         anchor_weights: Optional[torch.Tensor] = None,
+        node_weights: Optional[torch.Tensor] = None,
         model_type: str = "stgcn",
     ) -> None:
         device = next(forecaster.parameters()).device
@@ -93,6 +94,7 @@ class ForecastGuidance:
         else:
             weights = None
         self.anchor_weights = weights
+        self.node_weights = node_weights.to(device).float() if node_weights is not None else None
 
         self.forecaster.eval()
 
@@ -124,7 +126,11 @@ class ForecastGuidance:
             x.requires_grad_(True)
             forecaster_input = prepare_forecaster_input(x)
             prediction = forward_pass(self.forecaster, forecaster_input, self.model_type)
-            loss = F.mse_loss(prediction, self.target)
+            base_error = (prediction - self.target).pow(2)
+            if self.node_weights is not None:
+                node_w = self.node_weights.view(1, -1, 1)
+                base_error = base_error * node_w
+            loss = base_error.mean()
             if (
                 self.baseline is not None
                 and self.anchor_weights is not None
@@ -132,6 +138,8 @@ class ForecastGuidance:
             ):
                 anchor_term = (prediction - self.baseline).pow(2)
                 anchor_term = anchor_term * self.anchor_weights
+                if self.node_weights is not None:
+                    anchor_term = anchor_term * self.node_weights.view(1, -1, 1)
                 loss = loss + self.config.anchor_loss_scale * anchor_term.mean()
             if self.config.temporal_weight > 0:
                 loss = loss + self.config.temporal_weight * temporal_smoothness(x, self.mask)
