@@ -1,3 +1,4 @@
 # Ignore all files in data folder
 preprocessing/data/
 __pycache__/
+checkpoints/

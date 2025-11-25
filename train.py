@@ -26,7 +26,12 @@ from preprocessing.data_reader import TemporalDatasetBundle, load_dataset
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train spatio-temporal models on traffic datasets.")
     parser.add_argument("--model", type=str, choices=["stgcn", "graphwavenet","mstgcn", "astgcn"], default="stgcn")
-    parser.add_argument("--dataset", type=str, choices=["METRLA", "PEMSBAY"], default="METRLA")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30"],
+        default="METRLA",
+    )
     parser.add_argument("--data_root", type=str, default=None, help="Path to dataset root directory.")
     parser.add_argument("--lag", type=int, default=12, help="Number of historical steps.")
     parser.add_argument("--horizon", type=int, default=12, help="Prediction horizon.")

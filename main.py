@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import shlex
 import sys
 from dataclasses import asdict
@@ -31,7 +32,12 @@ from train import build_dataloaders, train_pipeline, test_pipeline
 def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> argparse.ArgumentParser:
     parser = subparsers.add_parser("forecaster", help="Train or evaluate an ST-GNN forecaster.")
     parser.add_argument("--model", type=str, choices=["stgcn", "graphwavenet", "mstgcn", "astgcn"], default="stgcn")
-    parser.add_argument("--dataset", type=str, choices=["METRLA", "PEMSBAY"], default="METRLA")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30"],
+        default="METRLA",
+    )
     parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--lag", type=int, default=12)
     parser.add_argument("--horizon", type=int, default=12)
@@ -70,7 +76,12 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
 
 def add_diffusion_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> argparse.ArgumentParser:
     parser = subparsers.add_parser("diffusion", help="Train the diffusion prior over past trajectories.")
-    parser.add_argument("--dataset", type=str, choices=["METRLA", "PEMSBAY"], default="METRLA")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30"],
+        default="METRLA",
+    )
     parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--lag", type=int, default=96)
     parser.add_argument("--horizon", type=int, default=24)
@@ -159,6 +170,30 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         type=str,
         default=None,
         help="Optional path to save a plot comparing original and counterfactual predictions.",
+    )
+    parser.add_argument(
+        "--plot_top_cf_window_path",
+        type=str,
+        default=None,
+        help="Optional path to save a grid plot of the top-changed nodes in the past window (original vs counterfactual).",
+    )
+    parser.add_argument(
+        "--plot_top_cf_window_k",
+        type=int,
+        default=10,
+        help="Number of nodes to include in the past-window grid plot (ranked by mean absolute edit).",
+    )
+    parser.add_argument(
+        "--plot_top_cf_window_feature",
+        type=int,
+        default=0,
+        help="Feature index to visualize for the past-window grid plot.",
+    )
+    parser.add_argument(
+        "--plot_lag_steps",
+        type=int,
+        default=None,
+        help="Number of lagged time steps to plot (from most recent backwards). If None, plots all available lag steps.",
     )
     parser.add_argument(
         "--guidance_start_source",
@@ -566,6 +601,7 @@ def save_prediction_plot(
     ground_truth: torch.Tensor,
     guidance_target: Optional[torch.Tensor] = None,
     lag_target: Optional[torch.Tensor] = None,
+    plot_lag_steps: Optional[int] = None,
 ) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -580,7 +616,13 @@ def save_prediction_plot(
     lag_values = None
     if lag_target is not None and lag_target.dim() == 2 and lag_target.shape[0] > node_index:
         lag_values = lag_target[node_index].detach().cpu().numpy()
-        lag_steps = list(range(-lag_target.shape[1] + 1, 1))
+        # Limit the number of lag steps to plot if specified
+        if plot_lag_steps is not None and plot_lag_steps > 0:
+            num_lag_steps = min(plot_lag_steps, lag_target.shape[1])
+            lag_values = lag_values[-num_lag_steps:]  # Take the most recent N steps
+        else:
+            num_lag_steps = lag_target.shape[1]
+        lag_steps = list(range(-num_lag_steps + 1, 1))
 
     plot_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(8, 4))
@@ -620,6 +662,68 @@ def save_prediction_plot(
     plt.tight_layout()
     plt.savefig(plot_path)
     plt.close()
+
+
+def save_top_cf_window_plot(
+    plot_path: Path,
+    original_window: torch.Tensor,
+    cf_window: torch.Tensor,
+    top_k: int = 10,
+    feature: int = 0,
+    ncols: int = 5,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib is not available; skipping top-k past window plot.")
+        return
+
+    if original_window.shape != cf_window.shape:
+        raise ValueError(f"Shape mismatch between original ({original_window.shape}) and counterfactual ({cf_window.shape}) windows")
+    lag, num_nodes, num_features = original_window.shape
+    if num_nodes == 0 or lag == 0:
+        print("Empty window; skipping top-k past window plot.")
+        return
+
+    feature_idx = max(0, min(feature, num_features - 1))
+    top_k = max(1, min(int(top_k), num_nodes))
+    diffs = (cf_window - original_window).abs().mean(dim=(0, 2))
+    top_nodes = torch.argsort(diffs, descending=True)[:top_k]
+
+    ncols = max(1, int(ncols))
+    nrows = math.ceil(top_k / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4, nrows * 3), sharex=True)
+    axes = axes.flatten()
+    time_steps = np.arange(lag)
+
+    for ax, node in zip(axes, top_nodes):
+        idx = int(node.item())
+        ax.plot(
+            time_steps,
+            original_window[:, idx, feature_idx].detach().cpu().numpy(),
+            label="Original",
+            linewidth=2,
+        )
+        ax.plot(
+            time_steps,
+            cf_window[:, idx, feature_idx].detach().cpu().numpy(),
+            label="Counterfactual",
+            linestyle="--",
+            linewidth=2,
+        )
+        ax.set_title(f"Node {idx} | Δ={diffs[idx]:.3f}")
+        ax.grid(True, alpha=0.3)
+
+    for ax in axes[len(top_nodes) :]:
+        ax.axis("off")
+
+    axes[0].legend()
+    fig.suptitle(f"Top {top_k} nodes by mean abs edit (feature {feature_idx})", y=1.02)
+    fig.tight_layout()
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(plot_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved top-k past-window plot to {plot_path}")
 
 
 def select_split_dataset(bundle: TemporalDatasetBundle, split: str):
@@ -818,6 +922,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
     mse_cpu = mse.detach().cpu()
     best_idx = int(torch.argmin(mse_cpu).item())
     best_cf_prediction = cf_preds_cpu[best_idx]
+    best_cf_window = samples[best_idx].detach().cpu().float()
 
     plot_node = args.plot_node if args.plot_node is not None else (args.target_adjust_node if args.target_adjust_node >= 0 else 0)
     plot_path = Path(args.plot_path) if args.plot_path else Path(args.output_path).with_name(Path(args.output_path).stem + "_plot.png")
@@ -835,6 +940,17 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             default_target,
             guidance_target,
             lag_target=lag_target,
+            plot_lag_steps=args.plot_lag_steps,
+        )
+
+    top_window_plot_path = Path(args.plot_top_cf_window_path) if args.plot_top_cf_window_path else None
+    if top_window_plot_path is not None:
+        save_top_cf_window_plot(
+            top_window_plot_path,
+            past_window.detach().cpu().float(),
+            best_cf_window,
+            top_k=args.plot_top_cf_window_k,
+            feature=args.plot_top_cf_window_feature,
         )
 
     output = {
@@ -858,9 +974,11 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         "target_adjust_node": args.target_adjust_node,
         "use_predicted_target": args.use_predicted_target,
         "plot_path": str(plot_path),
+        "top_cf_window_plot_path": str(top_window_plot_path) if top_window_plot_path else None,
         "counterfactual_mse": mse_cpu,
         "best_sample_index": best_idx,
         "best_counterfactual_prediction": best_cf_prediction,
+        "best_counterfactual_window": best_cf_window,
         "cf_horizon": cf_horizon,
         "anchor_weights": anchor_weights,
         "anchor_release_power": args.anchor_release_power,
