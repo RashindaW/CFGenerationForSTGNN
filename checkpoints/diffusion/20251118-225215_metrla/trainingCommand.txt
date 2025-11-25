@@ -1,1 +1,0 @@
-/home/rashinda/.conda/envs/rashindaNew-torch-env/bin/python main.py diffusion --dataset METRLA --lag 12 --horizon 12 --batch_size 64 --epochs 200 --learning_rate 1e-5 --diffusion_timesteps 250 --beta_schedule cosine --gpus 3
