@@ -128,9 +128,12 @@ class ForecastGuidance:
             prediction = forward_pass(self.forecaster, forecaster_input, self.model_type)
             base_error = (prediction - self.target).pow(2)
             if self.node_weights is not None:
-                node_w = self.node_weights.view(1, -1, 1)
-                base_error = base_error * node_w
-            loss = base_error.mean()
+                node_w = self.node_weights.view(1, -1, 1)  # (1, N, 1)
+                weighted = base_error * node_w
+                denom = node_w.sum().clamp(min=1e-8)
+                loss = (weighted.sum(dim=(1, 2)) / denom).mean()
+            else:
+                loss = base_error.mean()
             if (
                 self.baseline is not None
                 and self.anchor_weights is not None
@@ -140,7 +143,11 @@ class ForecastGuidance:
                 anchor_term = anchor_term * self.anchor_weights
                 if self.node_weights is not None:
                     anchor_term = anchor_term * self.node_weights.view(1, -1, 1)
-                loss = loss + self.config.anchor_loss_scale * anchor_term.mean()
+                    denom = self.node_weights.sum().clamp(min=1e-8)
+                    anchor_loss = (anchor_term.sum(dim=(1, 2)) / denom).mean()
+                else:
+                    anchor_loss = anchor_term.mean()
+                loss = loss + self.config.anchor_loss_scale * anchor_loss
             if self.config.temporal_weight > 0:
                 loss = loss + self.config.temporal_weight * temporal_smoothness(x, self.mask)
             if self.config.spatial_weight > 0:

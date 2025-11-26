@@ -259,6 +259,13 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         default="cosine",
         help="Noise schedule used for diffusion-based guidance imputation.",
     )
+    parser.add_argument(
+        "--guidance_path_strategy",
+        type=str,
+        choices=["diffusion", "linear"],
+        default="diffusion",
+        help="How to construct the guidance trajectory between start (last lag) and adjusted target endpoint.",
+    )
     parser.set_defaults(handler=run_counterfactual_command)
     return parser
 
@@ -622,6 +629,45 @@ def build_diffusion_guidance_target(
         prior_path = baseline[node]
         imputed = diffusion_impute_path(start_val, end_val, prior_path, betas)
         guidance[node] = imputed
+
+    return guidance
+
+
+def build_linear_guidance_target(
+    baseline: torch.Tensor,
+    adjusted_target: torch.Tensor,
+    past_window: torch.Tensor,
+    target_node: int,
+    target_channel: int,
+) -> torch.Tensor:
+    """
+    Linearly interpolate between the last observed lag value and the adjusted target endpoint
+    for the chosen node(s); other nodes follow the baseline forecast.
+    """
+
+    if baseline.shape != adjusted_target.shape:
+        raise ValueError("baseline and adjusted_target must share the same shape for linear guidance")
+    horizon = baseline.shape[1]
+    if horizon == 0:
+        return baseline.clone()
+
+    num_nodes = baseline.shape[0]
+    if target_node >= num_nodes or target_node < -1:
+        raise ValueError(f"target_adjust_node {target_node} is out of range for {num_nodes} nodes")
+    if target_channel < 0 or target_channel >= past_window.shape[-1]:
+        raise ValueError(f"target_channel {target_channel} is out of range for past window features {past_window.shape[-1]}")
+
+    guidance = baseline.clone()
+    start_values = past_window[-1, :, target_channel].to(baseline.device, baseline.dtype)
+    target_nodes = range(num_nodes) if target_node < 0 else [target_node]
+    steps = torch.linspace(0.0, 1.0, steps=horizon, device=baseline.device, dtype=baseline.dtype)
+
+    for node in target_nodes:
+        start_val = start_values[node]
+        end_val = adjusted_target[node, -1].to(baseline.device, baseline.dtype)
+        interp = start_val + (end_val - start_val) * steps
+        interp[-1] = end_val
+        guidance[node] = interp
 
     return guidance
 
@@ -1009,17 +1055,26 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
     if args.target_path is not None:
         guidance_target = adjusted_target.clone()
     else:
-        guidance_target = build_diffusion_guidance_target(
-            baseline_forecast,
-            adjusted_target,
-            past_window,
-            args.target_adjust_node,
-            target_ch,
-            impute_steps=args.guidance_impute_steps,
-            beta_schedule=args.guidance_impute_schedule,
-            beta_start=diffusion.config.beta_start,
-            beta_end=diffusion.config.beta_end,
-        )
+        if args.guidance_path_strategy == "linear":
+            guidance_target = build_linear_guidance_target(
+                baseline_forecast,
+                adjusted_target,
+                past_window,
+                args.target_adjust_node,
+                target_ch,
+            )
+        else:
+            guidance_target = build_diffusion_guidance_target(
+                baseline_forecast,
+                adjusted_target,
+                past_window,
+                args.target_adjust_node,
+                target_ch,
+                impute_steps=args.guidance_impute_steps,
+                beta_schedule=args.guidance_impute_schedule,
+                beta_start=diffusion.config.beta_start,
+                beta_end=diffusion.config.beta_end,
+            )
     anchor_start = max(args.anchor_start_weight, 0.0)
     anchor_end = max(args.anchor_end_weight, 0.0)
     if guidance_target is not None:
