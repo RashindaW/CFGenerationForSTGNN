@@ -25,6 +25,7 @@ from counterfactual import (
     SpatioTemporalUNet,
 )
 from counterfactual.guidance import prepare_forecaster_input
+from counterfactual.noise_schedule import build_beta_schedule, prepare_diffusion_terms
 from preprocessing.data_reader import TemporalDatasetBundle, load_dataset
 from train import build_dataloaders, train_pipeline, test_pipeline
 
@@ -244,6 +245,19 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         type=float,
         default=1.5,
         help="Exponent that shapes how quickly anchor weights decay toward the horizon (values > 1 hold longer).",
+    )
+    parser.add_argument(
+        "--guidance_impute_steps",
+        type=int,
+        default=64,
+        help="Number of diffusion steps to use when imputing the guidance trajectory between anchors.",
+    )
+    parser.add_argument(
+        "--guidance_impute_schedule",
+        type=str,
+        choices=["linear", "cosine"],
+        default="cosine",
+        help="Noise schedule used for diffusion-based guidance imputation.",
     )
     parser.set_defaults(handler=run_counterfactual_command)
     return parser
@@ -496,6 +510,120 @@ def adjust_target(
     if offset != 0.0:
         adjusted[indices, -1] = adjusted[indices, -1] + offset
     return adjusted
+
+
+def _temporal_smooth_1d(x: torch.Tensor) -> torch.Tensor:
+    if x.numel() <= 1:
+        return x
+    left = torch.cat([x[:1], x[:-1]])
+    right = torch.cat([x[1:], x[-1:]])
+    return (left + x + right) / 3.0
+
+
+def diffusion_impute_path(
+    start_value: torch.Tensor,
+    end_value: torch.Tensor,
+    prior_path: torch.Tensor,
+    betas: torch.Tensor,
+    smooth_weight: float = 0.65,
+    prior_weight: float = 0.35,
+) -> torch.Tensor:
+    """Diffusion-style imputation of a 1D temporal path with fixed endpoints."""
+
+    device = prior_path.device
+    dtype = prior_path.dtype
+    horizon = prior_path.shape[0]
+    if horizon == 0:
+        return prior_path.clone()
+
+    terms = prepare_diffusion_terms(betas)
+    terms = {k: v.to(device=device, dtype=dtype) for k, v in terms.items()}
+
+    anchor_mask = torch.zeros(horizon, device=device, dtype=dtype)
+    anchor_mask[0] = 1.0
+    anchor_mask[-1] = 1.0
+    anchor_values = torch.zeros_like(prior_path)
+    anchor_values[0] = start_value
+    anchor_values[-1] = end_value
+
+    # Initialize with anchors + noisy prior.
+    x = anchor_mask * anchor_values + (1 - anchor_mask) * prior_path
+    x = terms["sqrt_alphas_cumprod"][-1] * x + terms["sqrt_one_minus_alphas_cumprod"][-1] * torch.randn_like(x)
+
+    smooth_weight = float(min(max(smooth_weight, 0.0), 1.0))
+    prior_weight = float(min(max(prior_weight, 0.0), 1.0))
+    free_weight = max(0.0, 1.0 - (smooth_weight + prior_weight))
+
+    for t_idx in range(betas.numel() - 1, -1, -1):
+        smooth = _temporal_smooth_1d(x)
+        x0_pred = prior_weight * prior_path + smooth_weight * smooth + free_weight * x
+        x0_pred = anchor_mask * anchor_values + (1 - anchor_mask) * x0_pred
+
+        sqrt_alpha_bar = terms["sqrt_alphas_cumprod"][t_idx]
+        sqrt_one_minus_alpha_bar = torch.clamp(terms["sqrt_one_minus_alphas_cumprod"][t_idx], min=1e-8)
+        betas_t = terms["betas"][t_idx]
+        sqrt_recip_alpha = terms["sqrt_recip_alphas"][t_idx]
+        posterior_variance_t = terms["posterior_variance"][t_idx]
+
+        eps = (x - sqrt_alpha_bar * x0_pred) / sqrt_one_minus_alpha_bar
+        model_mean = sqrt_recip_alpha * (x - betas_t / sqrt_one_minus_alpha_bar * eps)
+
+        if t_idx == 0:
+            x = model_mean
+        else:
+            noise = torch.randn_like(x)
+            x = model_mean + torch.sqrt(posterior_variance_t) * noise
+
+        # Reinforce anchors after each denoise step.
+        x = anchor_mask * anchor_values + (1 - anchor_mask) * x
+
+    return x
+
+
+def build_diffusion_guidance_target(
+    baseline: torch.Tensor,
+    adjusted_target: torch.Tensor,
+    past_window: torch.Tensor,
+    target_node: int,
+    target_channel: int,
+    impute_steps: int = 64,
+    beta_schedule: str = "cosine",
+    beta_start: float = 1e-4,
+    beta_end: float = 0.02,
+) -> torch.Tensor:
+    """
+    Form a guidance trajectory by anchoring the first point to the last observed lag value
+    and the last point to the adjusted target, then imputing the in-between steps via diffusion.
+    """
+
+    if baseline.shape != adjusted_target.shape:
+        raise ValueError("baseline and adjusted_target must share the same shape for diffusion guidance")
+    horizon = baseline.shape[1]
+    if horizon == 0:
+        return baseline.clone()
+
+    num_nodes = baseline.shape[0]
+    if target_node >= num_nodes or target_node < -1:
+        raise ValueError(f"target_adjust_node {target_node} is out of range for {num_nodes} nodes")
+
+    impute_steps = int(max(1, impute_steps))
+    betas = build_beta_schedule(beta_schedule, impute_steps, beta_start=beta_start, beta_end=beta_end).to(baseline.device)
+    guidance = baseline.clone()
+
+    if target_channel < 0 or target_channel >= past_window.shape[-1]:
+        raise ValueError(f"target_channel {target_channel} is out of range for past window features {past_window.shape[-1]}")
+
+    start_values = past_window[-1, :, target_channel].to(baseline.device, baseline.dtype)
+    target_nodes = range(num_nodes) if target_node < 0 else [target_node]
+
+    for node in target_nodes:
+        start_val = start_values[node]
+        end_val = adjusted_target[node, -1].to(baseline.device, baseline.dtype)
+        prior_path = baseline[node]
+        imputed = diffusion_impute_path(start_val, end_val, prior_path, betas)
+        guidance[node] = imputed
+
+    return guidance
 
 
 def build_guidance_target(
@@ -865,6 +993,10 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         )
     baseline_forecast = truncate_horizon(baseline_forecast, cf_horizon)
 
+    target_ch = dataset_meta.get("target_channel", 0)
+    if target_ch < 0 or target_ch >= past_window.shape[-1]:
+        raise ValueError(f"target_channel {target_ch} is out of range for past window features {past_window.shape[-1]}")
+
     if args.use_predicted_target:
         target_source = baseline_forecast.clone()
     else:
@@ -874,27 +1006,19 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         adjust_target(target_source, args.target_adjust_percent, args.target_adjust_offset, args.target_adjust_node).float(),
         cf_horizon,
     )
-    lag_start = None
-    if args.guidance_start_source == "lag":
-        target_ch = dataset_meta.get("target_channel", 0)
-        if target_ch < 0 or target_ch >= past_window.shape[-1]:
-            raise ValueError(f"target_channel {target_ch} is out of range for past window features {past_window.shape[-1]}")
-        lag_start = past_window[:, :, target_ch].float()[0]
-        lag_length = past_window.shape[0]
-    else:
-        lag_length = past_window.shape[0]
     if args.target_path is not None:
         guidance_target = adjusted_target.clone()
     else:
-        guidance_target = build_guidance_target(
+        guidance_target = build_diffusion_guidance_target(
             baseline_forecast,
             adjusted_target,
+            past_window,
             args.target_adjust_node,
-            start_source=args.guidance_start_source,
-            start_target=default_target,
-            interpolation=args.guidance_interpolation,
-            lag_start=lag_start,
-            lag_length=lag_length,
+            target_ch,
+            impute_steps=args.guidance_impute_steps,
+            beta_schedule=args.guidance_impute_schedule,
+            beta_start=diffusion.config.beta_start,
+            beta_end=diffusion.config.beta_end,
         )
     anchor_start = max(args.anchor_start_weight, 0.0)
     anchor_end = max(args.anchor_end_weight, 0.0)
@@ -912,6 +1036,9 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
     if args.target_adjust_node >= 0:
         node_weights = compute_hop_node_weights(bundle.adjacency, args.target_adjust_node, args.target_focus_percent)
     mask = prepare_mask(past_window.shape[0], bundle.num_nodes, bundle.num_features, args.mask_path)
+    if args.target_adjust_node >= 0:
+        # Prevent direct edits to the target node; guidance can only modify other nodes.
+        mask[:, args.target_adjust_node, :] = 0.0
 
     sample_shape = torch.Size(past_window.shape)  # (T, N, F)
     mask = mask.to(device)
