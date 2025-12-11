@@ -26,6 +26,15 @@ from counterfactual import (
 )
 from counterfactual.guidance import prepare_forecaster_input
 from counterfactual.noise_schedule import build_beta_schedule, prepare_diffusion_terms
+from counterfactual.subgraph import (
+    RandomWalkConfig,
+    build_node_weight_vector,
+    build_random_walk_subgraphs,
+    ensure_subgraph_cache,
+    load_subgraph,
+    random_walk_subgraph,
+    save_subgraphs,
+)
 from preprocessing.data_reader import TemporalDatasetBundle, load_dataset
 from train import build_dataloaders, train_pipeline, test_pipeline
 
@@ -116,6 +125,26 @@ def add_diffusion_subcommand(subparsers: argparse._SubParsersAction[argparse.Arg
     return parser
 
 
+def add_subgraph_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> argparse.ArgumentParser:
+    parser = subparsers.add_parser("subgraphs", help="Precompute random-walk subgraphs for each node.")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30"],
+        default="METRLA",
+    )
+    parser.add_argument("--data_root", type=str, default=None, help="Root directory containing dataset folders.")
+    parser.add_argument("--output_dir", type=str, default=None, help="Override subgraph output directory.")
+    parser.add_argument("--num_walks", type=int, default=128, help="Number of random walks per node.")
+    parser.add_argument("--walk_length", type=int, default=8, help="Steps per walk.")
+    parser.add_argument("--restart_prob", type=float, default=0.15, help="Restart probability during walks.")
+    parser.add_argument("--top_k", type=int, default=16, help="Keep the top-k visited neighbors per node.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument("--overwrite", action="store_true", help="Rebuild and overwrite any existing cache.")
+    parser.set_defaults(handler=run_subgraph_command)
+    return parser
+
+
 def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> argparse.ArgumentParser:
     parser = subparsers.add_parser("counterfactual", help="Generate diffusion-guided counterfactual past windows.")
     parser.add_argument("--forecaster_checkpoint", type=str, required=True)
@@ -164,8 +193,32 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         "--target_focus_percent",
         type=float,
         default=80.0,
-        help="Percentage of forecast loss weight given to the adjusted node; remaining weight is distributed to other nodes by inverse hop distance.",
+        help="Percentage of forecast loss weight given to the adjusted node; remaining weight is distributed according to the chosen node-loss strategy.",
     )
+    parser.add_argument(
+        "--node_loss_strategy",
+        type=str,
+        choices=["subgraph", "hop", "uniform"],
+        default="subgraph",
+        help="How to distribute forecast loss across nodes for guidance.",
+    )
+    parser.add_argument(
+        "--subgraph_dir",
+        type=str,
+        default=None,
+        help="Directory containing per-node subgraph .npy files (defaults to <data_root>/<dataset>/subgraphs_random_walk).",
+    )
+    parser.add_argument("--subgraph_num_walks", type=int, default=128, help="Random walks per node for subgraph cache.")
+    parser.add_argument("--subgraph_walk_length", type=int, default=8, help="Steps per random walk.")
+    parser.add_argument("--subgraph_restart_prob", type=float, default=0.15, help="Restart probability for random walks.")
+    parser.add_argument("--subgraph_top_k", type=int, default=16, help="Top-k visited neighbors to keep per node.")
+    parser.add_argument(
+        "--subgraph_spillover_percent",
+        type=float,
+        default=5.0,
+        help="Percent of remaining (non-target) weight spilled uniformly outside the subgraph.",
+    )
+    parser.add_argument("--subgraph_seed", type=int, default=42, help="Seed for building subgraph cache.")
     parser.add_argument(
         "--plot_node",
         type=int,
@@ -275,6 +328,7 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
     add_forecaster_subcommand(subparsers)
     add_diffusion_subcommand(subparsers)
+    add_subgraph_subcommand(subparsers)
     add_counterfactual_subcommand(subparsers)
     args = parser.parse_args()
     gpus = getattr(args, "gpus", None)
@@ -473,6 +527,30 @@ def run_diffusion_command(args: argparse.Namespace) -> None:
             ema_state = trainer.ema.state_dict() if trainer.ema is not None else None
             save_diffusion_checkpoint(checkpoint_path, epoch, diffusion, optimizer, diffusion_config, dataset_meta, model_meta, metrics, ema_state)
             print(f"Saved best diffusion checkpoint to {checkpoint_path}")
+
+
+def run_subgraph_command(args: argparse.Namespace) -> None:
+    dataset_dir = resolve_dataset_dir(args.dataset, args.data_root)
+    adj_path = dataset_dir / "adj_mat.npy"
+    if not adj_path.exists():
+        raise FileNotFoundError(f"Adjacency file not found at {adj_path}")
+
+    adjacency = np.load(adj_path)
+    cache_dir = Path(args.output_dir) if args.output_dir else default_subgraph_dir(args.dataset, args.data_root)
+    config = RandomWalkConfig(
+        num_walks=args.num_walks,
+        walk_length=args.walk_length,
+        restart_prob=args.restart_prob,
+        top_k=args.top_k,
+        seed=args.seed,
+    )
+    if args.overwrite:
+        subgraphs = build_random_walk_subgraphs(adjacency, config)
+        save_subgraphs(subgraphs, cache_dir, config)
+        print(f"Rebuilt subgraph cache at {cache_dir}")
+    else:
+        ensure_subgraph_cache(adjacency, cache_dir, config)
+        print(f"Subgraph cache ready at {cache_dir}")
 
 
 def prepare_mask(lag: int, num_nodes: int, num_features: int, source: Optional[str]) -> torch.Tensor:
@@ -807,6 +885,69 @@ def compute_hop_node_weights(adjacency: torch.Tensor, target_node: int, focus_pe
     return weights / total
 
 
+def resolve_dataset_dir(dataset: str, data_root: Optional[str | Path]) -> Path:
+    base = Path(data_root) if data_root is not None else Path(__file__).resolve().parent / "preprocessing" / "data"
+    return base / dataset.upper()
+
+
+def default_subgraph_dir(dataset: str, data_root: Optional[str | Path]) -> Path:
+    return resolve_dataset_dir(dataset, data_root) / "subgraphs_random_walk"
+
+
+def prepare_node_weights(
+    adjacency: torch.Tensor,
+    target_node: int,
+    focus_percent: float,
+    strategy: str,
+    dataset: str,
+    data_root: Optional[str | Path],
+    subgraph_args: argparse.Namespace,
+) -> Optional[torch.Tensor]:
+    if target_node < 0:
+        return None
+
+    adj_for_weights = adjacency[0] if adjacency.dim() == 3 else adjacency
+    num_nodes = adj_for_weights.shape[0]
+    if target_node >= num_nodes:
+        raise ValueError(f"target_adjust_node {target_node} is out of range for {num_nodes} nodes")
+    if strategy == "uniform":
+        weights = torch.ones(num_nodes, dtype=torch.float32)
+        return weights / weights.sum().clamp(min=1e-8)
+
+    if strategy == "hop":
+        return compute_hop_node_weights(adjacency, target_node, focus_percent)
+
+    subgraph_cache = Path(subgraph_args.subgraph_dir) if subgraph_args.subgraph_dir else default_subgraph_dir(dataset, data_root)
+    rw_config = RandomWalkConfig(
+        num_walks=subgraph_args.subgraph_num_walks,
+        walk_length=subgraph_args.subgraph_walk_length,
+        restart_prob=subgraph_args.subgraph_restart_prob,
+        top_k=subgraph_args.subgraph_top_k,
+        seed=subgraph_args.subgraph_seed,
+    )
+    adj_np = adjacency.detach().cpu().numpy()
+    if adj_np.ndim == 3:
+        adj_np = adj_np[0]
+    try:
+        ensure_subgraph_cache(adj_np, subgraph_cache, rw_config)
+    except Exception as exc:  # pragma: no cover - cache writes may be skipped in read-only envs
+        print(f"Warning: could not build subgraph cache at {subgraph_cache}: {exc}")
+    subgraph_path = subgraph_cache / f"node_{target_node}.npy"
+    if subgraph_path.exists():
+        nodes, weights = load_subgraph(subgraph_path)
+    else:
+        nodes, weights = random_walk_subgraph(adj_np, target_node, rw_config)
+    spillover_fraction = max(0.0, subgraph_args.subgraph_spillover_percent / 100.0)
+    return build_node_weight_vector(
+        num_nodes=adj_np.shape[0],
+        target_node=target_node,
+        target_share=focus_percent / 100.0,
+        subgraph_nodes=nodes,
+        subgraph_weights=weights,
+        spillover_fraction=spillover_fraction,
+    )
+
+
 def truncate_horizon(tensor: torch.Tensor, horizon: Optional[int]) -> torch.Tensor:
     if horizon is None or tensor.shape[1] <= horizon:
         return tensor
@@ -1087,9 +1228,16 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         )
     else:
         anchor_weights = torch.linspace(anchor_start, anchor_end, steps=cf_horizon, dtype=torch.float32)
-    node_weights = None
-    if args.target_adjust_node >= 0:
-        node_weights = compute_hop_node_weights(bundle.adjacency, args.target_adjust_node, args.target_focus_percent)
+    subgraph_cache_dir = Path(args.subgraph_dir) if args.subgraph_dir else default_subgraph_dir(dataset_meta["dataset"], args.data_root)
+    node_weights = prepare_node_weights(
+        adjacency=bundle.adjacency,
+        target_node=args.target_adjust_node,
+        focus_percent=args.target_focus_percent,
+        strategy=args.node_loss_strategy,
+        dataset=dataset_meta["dataset"],
+        data_root=args.data_root,
+        subgraph_args=args,
+    )
     mask = prepare_mask(past_window.shape[0], bundle.num_nodes, bundle.num_features, args.mask_path)
     if args.target_adjust_node >= 0:
         # Prevent direct edits to the target node; guidance can only modify other nodes.
@@ -1212,6 +1360,16 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         "target_adjust_offset": args.target_adjust_offset,
         "target_adjust_node": args.target_adjust_node,
         "target_focus_percent": args.target_focus_percent,
+        "node_loss_strategy": args.node_loss_strategy,
+        "subgraph_cache_dir": str(subgraph_cache_dir),
+        "subgraph_params": {
+            "num_walks": args.subgraph_num_walks,
+            "walk_length": args.subgraph_walk_length,
+            "restart_prob": args.subgraph_restart_prob,
+            "top_k": args.subgraph_top_k,
+            "spillover_percent": args.subgraph_spillover_percent,
+            "seed": args.subgraph_seed,
+        },
         "use_predicted_target": args.use_predicted_target,
         "plot_path": str(plot_path),
         "top_cf_window_plot_path": str(top_window_plot_path) if top_window_plot_path else None,
