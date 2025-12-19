@@ -11,10 +11,10 @@ import torch
 
 @dataclass(frozen=True)
 class RandomWalkConfig:
-    num_walks: int = 128
-    walk_length: int = 8
+    num_walks: int = 20000
+    walk_length: int = 40
     restart_prob: float = 0.15
-    top_k: int = 16
+    top_k: int = 3
     seed: int | None = None
 
 

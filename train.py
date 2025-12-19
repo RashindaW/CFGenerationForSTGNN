@@ -5,6 +5,8 @@ import csv
 from dataclasses import asdict
 import math
 import os
+import shlex
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -29,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30"],
+        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
         default="METRLA",
     )
     parser.add_argument("--data_root", type=str, default=None, help="Path to dataset root directory.")
@@ -359,6 +361,22 @@ def resolve_checkpoint_destination(args: argparse.Namespace) -> Tuple[Path, Path
     return run_dir, run_dir / "best.pt"
 
 
+def _format_training_command() -> str:
+    python_exec = sys.executable or "python"
+    try:
+        arg_string = shlex.join(sys.argv)
+    except AttributeError:
+        arg_string = " ".join(shlex.quote(arg) for arg in sys.argv)
+    return f"{python_exec} {arg_string}".strip()
+
+
+def write_training_command_file(directory: Path, filename: str = "trainingCommand.txt") -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    command_path = directory / filename
+    command_path.write_text(_format_training_command() + "\n")
+    return command_path
+
+
 def save_checkpoint(
     path: Path,
     args: argparse.Namespace,
@@ -390,6 +408,8 @@ def train_pipeline(args: argparse.Namespace) -> None:
     args.resolved_run_dir = str(run_dir)
     args.resolved_checkpoint_path = str(checkpoint_path)
     args.metrics_csv_path = str(run_dir / "metrics.csv")
+    command_dir = Path(__file__).resolve().parent / "training_commands" / run_dir.name
+    write_training_command_file(command_dir)
     if gpu_ids and len(gpu_ids) > 1:
         world_size = len(gpu_ids)
         mp.spawn(train_worker, args=(args, gpu_ids, True), nprocs=world_size, join=True)

@@ -47,6 +47,9 @@ class DataReader:
         "METRLA": {"values": "node_values.npy", "adjacency": "adj_mat.npy"},
         "METRLA_15": {"values": "node_values.npy", "adjacency": "adj_mat.npy"},
         "METRLA_30": {"values": "node_values.npy", "adjacency": "adj_mat.npy"},
+        "METRLA_SUB": {"values": "node_values.npy", "adjacency": "adj_mat.npy"},
+        "METRLA_SUB_15": {"values": "node_values.npy", "adjacency": "adj_mat.npy"},
+        "METRLA_SUB_30": {"values": "node_values.npy", "adjacency": "adj_mat.npy"},
         "PEMSBAY": {"values": "pems_node_values.npy", "adjacency": "pems_adj_mat.npy"},
     }
 

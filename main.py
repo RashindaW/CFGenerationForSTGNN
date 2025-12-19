@@ -36,6 +36,7 @@ from counterfactual.subgraph import (
     save_subgraphs,
 )
 from preprocessing.data_reader import TemporalDatasetBundle, load_dataset
+from preprocessing.graphwavenet_utils import StandardScaler
 from train import build_dataloaders, train_pipeline, test_pipeline
 
 
@@ -45,7 +46,7 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30"],
+        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
         default="METRLA",
     )
     parser.add_argument("--data_root", type=str, default=None)
@@ -89,7 +90,7 @@ def add_diffusion_subcommand(subparsers: argparse._SubParsersAction[argparse.Arg
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30"],
+        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
         default="METRLA",
     )
     parser.add_argument("--data_root", type=str, default=None)
@@ -130,7 +131,7 @@ def add_subgraph_subcommand(subparsers: argparse._SubParsersAction[argparse.Argu
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30"],
+        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
         default="METRLA",
     )
     parser.add_argument("--data_root", type=str, default=None, help="Root directory containing dataset folders.")
@@ -385,9 +386,11 @@ def _format_training_command() -> str:
     return f"{python_exec} {arg_string}".strip()
 
 
-def write_training_command_file(directory: Path) -> None:
-    command_path = directory / "trainingCommand.txt"
+def write_training_command_file(directory: Path, filename: str = "trainingCommand.txt") -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    command_path = directory / filename
     command_path.write_text(_format_training_command() + "\n")
+    return command_path
 
 
 def save_diffusion_checkpoint(
@@ -476,7 +479,8 @@ def run_diffusion_command(args: argparse.Namespace) -> None:
     )
 
     checkpoint_path = resolve_diffusion_checkpoint_path(args)
-    write_training_command_file(checkpoint_path.parent)
+    command_dir = Path(__file__).resolve().parent / "training_commands" / checkpoint_path.parent.name
+    write_training_command_file(command_dir)
     metrics_csv = checkpoint_path.parent / "metrics.csv"
     best_val = float("inf")
     start_epoch = 1
@@ -595,6 +599,22 @@ def adjust_target(
     if offset != 0.0:
         adjusted[indices, -1] = adjusted[indices, -1] + offset
     return adjusted
+
+
+def inverse_target_scale(tensor: torch.Tensor, scaler: StandardScaler) -> torch.Tensor:
+    """Inverse scale a (nodes, horizon) tensor for the target channel."""
+
+    arr = tensor.detach().cpu().numpy()
+    arr = scaler.inverse_transform(arr)
+    return torch.from_numpy(arr).to(tensor.dtype)
+
+
+def inverse_target_feature(tensor: torch.Tensor, target_channel: int, scaler: StandardScaler) -> torch.Tensor:
+    """Inverse scale only the target channel of a (T, N, F) tensor."""
+
+    arr = tensor.detach().cpu().numpy()
+    arr[..., target_channel] = scaler.inverse_transform(arr[..., target_channel])
+    return torch.from_numpy(arr).to(tensor.dtype)
 
 
 def _temporal_smooth_1d(x: torch.Tensor) -> torch.Tensor:
@@ -1310,6 +1330,12 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
     best_idx = int(torch.argmin(mse_cpu).item())
     best_cf_prediction = cf_preds_cpu[best_idx]
     best_cf_window = samples[best_idx].detach().cpu().float()
+    # Prepare unscaled versions for plotting.
+    baseline_plot = inverse_target_scale(baseline_forecast, bundle.scaler)
+    best_cf_prediction_plot = inverse_target_scale(best_cf_prediction, bundle.scaler)
+    adjusted_target_plot = inverse_target_scale(adjusted_target, bundle.scaler)
+    default_target_plot = inverse_target_scale(default_target, bundle.scaler)
+    guidance_target_plot = inverse_target_scale(guidance_target, bundle.scaler) if guidance_target is not None else None
 
     plot_node = args.plot_node if args.plot_node is not None else (args.target_adjust_node if args.target_adjust_node >= 0 else 0)
     plot_path = Path(args.plot_path) if args.plot_path else Path(args.output_path).with_name(Path(args.output_path).stem + "_plot.png")
@@ -1317,25 +1343,31 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
     lag_target = None
     if 0 <= target_ch < past_window.shape[-1]:
         lag_target = past_window[:, :, target_ch].permute(1, 0).contiguous()
+    lag_target_plot = inverse_target_scale(lag_target, bundle.scaler) if lag_target is not None else None
     if adjusted_target.shape[0] > 0 and adjusted_target.shape[1] > 0:
         save_prediction_plot(
             plot_path,
             plot_node,
-            baseline_forecast,
-            best_cf_prediction,
-            adjusted_target,
-            default_target,
-            guidance_target,
-            lag_target=lag_target,
+            baseline_plot,
+            best_cf_prediction_plot,
+            adjusted_target_plot,
+            default_target_plot,
+            guidance_target_plot,
+            lag_target=lag_target_plot,
             plot_lag_steps=args.plot_lag_steps,
         )
 
     top_window_plot_path = Path(args.plot_top_cf_window_path) if args.plot_top_cf_window_path else None
     if top_window_plot_path is not None:
+        past_plot = past_window.detach().cpu().float()
+        best_cf_window_plot = best_cf_window
+        if args.plot_top_cf_window_feature == target_ch:
+            past_plot = inverse_target_feature(past_plot, target_ch, bundle.scaler)
+            best_cf_window_plot = inverse_target_feature(best_cf_window_plot, target_ch, bundle.scaler)
         save_top_cf_window_plot(
             top_window_plot_path,
-            past_window.detach().cpu().float(),
-            best_cf_window,
+            past_plot,
+            best_cf_window_plot,
             top_k=args.plot_top_cf_window_k,
             feature=args.plot_top_cf_window_feature,
         )
