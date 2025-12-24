@@ -1,8 +1,0 @@
-{
-  "num_nodes": 206,
-  "num_walks": 128,
-  "walk_length": 8,
-  "restart_prob": 0.15,
-  "top_k": 16,
-  "seed": 42
-}

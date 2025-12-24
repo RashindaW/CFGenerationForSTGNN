@@ -307,6 +307,12 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         help="Number of diffusion steps to use when imputing the guidance trajectory between anchors.",
     )
     parser.add_argument(
+        "--guidance_impute_samples",
+        type=int,
+        default=10,
+        help="Number of imputed guidance trajectories to sample per node and select the smoothest.",
+    )
+    parser.add_argument(
         "--guidance_impute_schedule",
         type=str,
         choices=["linear", "cosine"],
@@ -625,6 +631,13 @@ def _temporal_smooth_1d(x: torch.Tensor) -> torch.Tensor:
     return (left + x + right) / 3.0
 
 
+def _temporal_roughness_1d(x: torch.Tensor) -> torch.Tensor:
+    if x.numel() <= 1:
+        return x.new_tensor(0.0)
+    diffs = x[1:] - x[:-1]
+    return torch.mean(diffs.pow(2))
+
+
 def diffusion_impute_path(
     start_value: torch.Tensor,
     end_value: torch.Tensor,
@@ -692,6 +705,7 @@ def build_diffusion_guidance_target(
     target_node: int,
     target_channel: int,
     impute_steps: int = 64,
+    num_samples: int = 10,
     beta_schedule: str = "cosine",
     beta_start: float = 1e-4,
     beta_end: float = 0.02,
@@ -712,6 +726,7 @@ def build_diffusion_guidance_target(
         raise ValueError(f"target_adjust_node {target_node} is out of range for {num_nodes} nodes")
 
     impute_steps = int(max(1, impute_steps))
+    num_samples = int(max(1, num_samples))
     betas = build_beta_schedule(beta_schedule, impute_steps, beta_start=beta_start, beta_end=beta_end).to(baseline.device)
     guidance = baseline.clone()
 
@@ -725,8 +740,15 @@ def build_diffusion_guidance_target(
         start_val = start_values[node]
         end_val = adjusted_target[node, -1].to(baseline.device, baseline.dtype)
         prior_path = baseline[node]
-        imputed = diffusion_impute_path(start_val, end_val, prior_path, betas)
-        guidance[node] = imputed
+        best_path = None
+        best_score = None
+        for _ in range(num_samples):
+            imputed = diffusion_impute_path(start_val, end_val, prior_path, betas)
+            score = float(_temporal_roughness_1d(imputed).item())
+            if best_score is None or score < best_score:
+                best_score = score
+                best_path = imputed
+        guidance[node] = prior_path if best_path is None else best_path
 
     return guidance
 
@@ -1232,6 +1254,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 args.target_adjust_node,
                 target_ch,
                 impute_steps=args.guidance_impute_steps,
+                num_samples=args.guidance_impute_samples,
                 beta_schedule=args.guidance_impute_schedule,
                 beta_start=diffusion.config.beta_start,
                 beta_end=diffusion.config.beta_end,
