@@ -147,6 +147,8 @@ class CounterfactualGenerator:
         num_samples: int = 1,
         max_steps: Optional[int] = None,
         warm_start: Optional[torch.Tensor] = None,
+        edit_mask: Optional[torch.Tensor] = None,
+        fixed_values: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         adjacency = self.adjacency.to(self.device)
         temporal_context = self.temporal_context
@@ -162,5 +164,7 @@ class CounterfactualGenerator:
             temporal_context=temporal_context,
             max_steps=max_steps,
             initial_x=warm_start,
+            edit_mask=edit_mask,
+            fixed_values=fixed_values,
         )
         return samples

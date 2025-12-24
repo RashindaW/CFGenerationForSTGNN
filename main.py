@@ -67,6 +67,13 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
     parser.add_argument("--gpus", type=str, default=None, help="Comma-separated CUDA device IDs, e.g., '0,1'.")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--target_channel", type=int, default=0)
+    parser.add_argument(
+        "--loss_focus",
+        type=str,
+        choices=["full", "last"],
+        default="full",
+        help="Compute loss/metrics over the full horizon or only the final step.",
+    )
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--output", type=str, default=None)
@@ -150,6 +157,12 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
     parser = subparsers.add_parser("counterfactual", help="Generate diffusion-guided counterfactual past windows.")
     parser.add_argument("--forecaster_checkpoint", type=str, required=True)
     parser.add_argument("--diffusion_checkpoint", type=str, required=True)
+    parser.add_argument(
+        "--short_forecaster_checkpoint",
+        type=str,
+        default=None,
+        help="One-step forecaster checkpoint used for iterative counterfactual guidance.",
+    )
     parser.add_argument("--data_root", type=str, default=None, help="Optional override for stored dataset root.")
     parser.add_argument("--split", type=str, choices=["train", "val", "test"], default="test")
     parser.add_argument("--sample_index", type=int, default=0)
@@ -157,6 +170,17 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
     parser.add_argument("--target_path", type=str, default=None, help="Optional path to a numpy target (H, N).")
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument(
+        "--iterative_guidance",
+        action="store_true",
+        help="Iteratively edit only the last lag step using a one-step forecaster.",
+    )
+    parser.add_argument(
+        "--iterative_steps",
+        type=int,
+        default=None,
+        help="Number of iterative steps (defaults to cf_horizon).",
+    )
     parser.add_argument("--lambda_scale", type=float, default=1.0)
     parser.add_argument("--eta", type=float, default=0.05)
     parser.add_argument("--temporal_weight", type=float, default=1e-3)
@@ -1281,15 +1305,12 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         data_root=args.data_root,
         subgraph_args=args,
     )
-    mask = prepare_mask(past_window.shape[0], bundle.num_nodes, bundle.num_features, args.mask_path)
+    base_mask = prepare_mask(past_window.shape[0], bundle.num_nodes, bundle.num_features, args.mask_path)
     if args.target_adjust_node >= 0:
         # Prevent direct edits to the target node; guidance can only modify other nodes.
-        mask[:, args.target_adjust_node, :] = 0.0
+        base_mask[:, args.target_adjust_node, :] = 0.0
 
     sample_shape = torch.Size(past_window.shape)  # (T, N, F)
-    mask = mask.to(device)
-    target_batched = guidance_target.unsqueeze(0).repeat(args.samples, 1, 1).to(device)
-    mask_batched = mask.unsqueeze(0).repeat(args.samples, 1, 1, 1).to(device)
 
     guidance_config = GuidanceConfig(
         lambda_scale=args.lambda_scale,
@@ -1304,6 +1325,220 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         anchor_end_weight=args.anchor_end_weight,
         anchor_loss_scale=args.anchor_loss_scale,
     )
+    generator = CounterfactualGenerator(
+        diffusion,
+        adjacency=bundle.adjacency.to(device),
+        device=device,
+        temporal_context=build_temporal_context(dataset_meta["lag"], device),
+    )
+
+    if args.iterative_guidance:
+        if not args.short_forecaster_checkpoint:
+            raise ValueError("--short_forecaster_checkpoint is required when --iterative_guidance is set.")
+        short_forecaster_path = Path(args.short_forecaster_checkpoint)
+        short_forecaster, short_bundle, short_meta = load_forecaster_from_checkpoint(
+            short_forecaster_path,
+            device,
+            Path(args.data_root) if args.data_root else None,
+        )
+        short_model_type = short_meta.get("model", "stgcn")
+        if short_meta.get("horizon", 1) != 1:
+            raise ValueError("Short-term forecaster must have horizon=1 for iterative guidance.")
+        if short_meta.get("lag") != dataset_meta.get("lag"):
+            raise ValueError("Short-term forecaster lag does not match the long-horizon forecaster lag.")
+        if short_meta.get("dataset") and short_meta.get("dataset") != dataset_meta.get("dataset"):
+            print("Warning: Short-term forecaster and long-horizon forecaster were trained on different datasets.")
+        if short_bundle.num_nodes != bundle.num_nodes or short_bundle.num_features != bundle.num_features:
+            raise ValueError("Short-term forecaster data shape does not match the long-horizon forecaster.")
+
+        iter_steps = args.iterative_steps if args.iterative_steps is not None else cf_horizon
+        if iter_steps <= 0:
+            raise ValueError("iterative_steps must be positive")
+        if iter_steps > cf_horizon:
+            raise ValueError(f"iterative_steps {iter_steps} exceeds cf_horizon {cf_horizon}")
+
+        edit_mask = torch.zeros_like(base_mask)
+        edit_mask[-1] = 1.0
+        edit_mask = edit_mask * base_mask
+        edit_mask = edit_mask.to(device)
+
+        node_w = node_weights.to(device) if node_weights is not None else torch.ones(bundle.num_nodes, device=device)
+        node_w = node_w / node_w.sum().clamp(min=1e-8)
+
+        current_window = past_window.to(device).float()
+        best_windows: list[torch.Tensor] = []
+        mse_per_step: list[float] = []
+        best_indices: list[int] = []
+        iterative_predictions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
+
+        for step in range(iter_steps):
+            step_target = guidance_target[:, step : step + 1].to(device)
+            target_batched = step_target.unsqueeze(0).repeat(args.samples, 1, 1)
+            mask_batched = edit_mask.unsqueeze(0).repeat(args.samples, 1, 1, 1)
+
+            baseline_step = baseline_forecast[:, step : step + 1] if baseline_forecast is not None else None
+            anchor_step = anchor_weights[step : step + 1] if anchor_weights is not None else None
+            guidance = ForecastGuidance(
+                forecaster=short_forecaster,
+                target=target_batched,
+                mask=mask_batched,
+                adjacency=bundle.adjacency.to(device),
+                config=guidance_config,
+                lower_bounds=args.lower_bound,
+                upper_bounds=args.upper_bound,
+                baseline=baseline_step,
+                anchor_weights=anchor_step,
+                node_weights=node_weights,
+                model_type=short_model_type,
+            )
+
+            fixed_values = current_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
+            warm_start = fixed_values if args.warm_start else None
+            samples = generator.generate(
+                sample_shape=sample_shape,
+                guidance=guidance,
+                num_samples=args.samples,
+                max_steps=args.max_steps,
+                warm_start=warm_start,
+                edit_mask=mask_batched,
+                fixed_values=fixed_values,
+            )
+
+            with torch.no_grad():
+                cf_input = prepare_forecaster_input(samples)
+                cf_preds = forecaster_module.forward_pass(short_forecaster, cf_input, short_model_type)
+                if cf_preds.dim() == 2:
+                    cf_preds = cf_preds.unsqueeze(-1)
+                cf_preds = cf_preds[:, :, :1]
+                diff_sq = (cf_preds - target_batched) ** 2
+                per_node = diff_sq.mean(dim=2)
+                mse = (per_node * node_w.view(1, -1)).sum(dim=1)
+
+            best_idx = int(torch.argmin(mse).item())
+            best_indices.append(best_idx)
+            best_pred = cf_preds[best_idx]
+            iterative_predictions[:, step] = best_pred.squeeze(-1)
+            mse_per_step.append(float(mse[best_idx].item()))
+
+            best_window = samples[best_idx]
+            best_windows.append(best_window.detach().cpu())
+
+            next_step = best_window[-1].clone()
+            if 0 <= target_ch < next_step.shape[-1]:
+                next_step[:, target_ch] = best_pred.squeeze(-1)
+            current_window = torch.cat([best_window[1:], next_step.unsqueeze(0)], dim=0)
+
+        iterative_predictions_cpu = iterative_predictions.detach().cpu()
+        final_window = current_window.detach().cpu()
+        baseline_slice = baseline_forecast[:, :iter_steps]
+        adjusted_slice = adjusted_target[:, :iter_steps]
+        default_slice = default_target[:, :iter_steps]
+        guidance_slice = guidance_target[:, :iter_steps] if guidance_target is not None else None
+
+        baseline_plot = inverse_target_scale(baseline_slice, bundle.scaler)
+        iterative_plot = inverse_target_scale(iterative_predictions_cpu, bundle.scaler)
+        adjusted_target_plot = inverse_target_scale(adjusted_slice, bundle.scaler)
+        default_target_plot = inverse_target_scale(default_slice, bundle.scaler)
+        guidance_target_plot = inverse_target_scale(guidance_slice, bundle.scaler) if guidance_slice is not None else None
+
+        plot_node = args.plot_node if args.plot_node is not None else (args.target_adjust_node if args.target_adjust_node >= 0 else 0)
+        plot_path = Path(args.plot_path) if args.plot_path else Path(args.output_path).with_name(Path(args.output_path).stem + "_plot.png")
+        lag_target = None
+        if 0 <= target_ch < past_window.shape[-1]:
+            lag_target = past_window[:, :, target_ch].permute(1, 0).contiguous()
+        lag_target_plot = inverse_target_scale(lag_target, bundle.scaler) if lag_target is not None else None
+
+        if iterative_predictions_cpu.shape[1] > 0:
+            save_prediction_plot(
+                plot_path,
+                plot_node,
+                baseline_plot,
+                iterative_plot,
+                adjusted_target_plot,
+                default_target_plot,
+                guidance_target_plot,
+                lag_target=lag_target_plot,
+                plot_lag_steps=args.plot_lag_steps,
+            )
+
+        top_window_plot_path = Path(args.plot_top_cf_window_path) if args.plot_top_cf_window_path else None
+        if top_window_plot_path is not None and best_windows:
+            past_plot = past_window.detach().cpu().float()
+            best_cf_window_plot = best_windows[0]
+            if args.plot_top_cf_window_feature == target_ch:
+                past_plot = inverse_target_feature(past_plot, target_ch, bundle.scaler)
+                best_cf_window_plot = inverse_target_feature(best_cf_window_plot, target_ch, bundle.scaler)
+            save_top_cf_window_plot(
+                top_window_plot_path,
+                past_plot,
+                best_cf_window_plot,
+                top_k=args.plot_top_cf_window_k,
+                feature=args.plot_top_cf_window_feature,
+            )
+
+        output = {
+            "mode": "iterative",
+            "samples": None,
+            "target": guidance_target[:, :iter_steps].unsqueeze(0).cpu(),
+            "mask": edit_mask.unsqueeze(0).cpu(),
+            "guidance": asdict(guidance_config),
+            "metadata": {
+                "forecaster_checkpoint": str(forecaster_path),
+                "short_forecaster_checkpoint": str(short_forecaster_path),
+                "diffusion_checkpoint": str(diffusion_path),
+                "dataset": dataset_meta,
+                "diffusion_dataset": dataset_info,
+                "split": args.split,
+                "sample_index": args.sample_index,
+            },
+            "baseline_forecast": baseline_slice,
+            "original_target": default_slice,
+            "adjusted_target": adjusted_slice,
+            "target_adjust_percent": args.target_adjust_percent,
+            "target_adjust_offset": args.target_adjust_offset,
+            "target_adjust_node": args.target_adjust_node,
+            "target_focus_percent": args.target_focus_percent,
+            "node_loss_strategy": args.node_loss_strategy,
+            "subgraph_cache_dir": str(subgraph_cache_dir),
+            "subgraph_params": {
+                "num_walks": args.subgraph_num_walks,
+                "walk_length": args.subgraph_walk_length,
+                "restart_prob": args.subgraph_restart_prob,
+                "top_k": args.subgraph_top_k,
+                "spillover_percent": args.subgraph_spillover_percent,
+                "seed": args.subgraph_seed,
+            },
+            "use_predicted_target": args.use_predicted_target,
+            "plot_path": str(plot_path),
+            "top_cf_window_plot_path": str(top_window_plot_path) if top_window_plot_path else None,
+            "counterfactual_mse": None,
+            "best_sample_index": None,
+            "best_counterfactual_prediction": iterative_predictions_cpu,
+            "best_counterfactual_window": final_window,
+            "cf_horizon": cf_horizon,
+            "iterative_steps": iter_steps,
+            "anchor_weights": anchor_weights,
+            "anchor_release_power": args.anchor_release_power,
+            "guidance_target": guidance_slice,
+            "node_weights": node_weights.cpu() if node_weights is not None else None,
+            "iterative": {
+                "predictions": iterative_predictions_cpu,
+                "targets": guidance_slice if guidance_slice is not None else None,
+                "mse_per_step": torch.tensor(mse_per_step, dtype=torch.float32),
+                "best_indices": best_indices,
+                "best_windows": torch.stack(best_windows) if best_windows else None,
+                "final_window": final_window,
+            },
+        }
+        output_path = Path(args.output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(output, output_path)
+        print(f"Saved iterative counterfactual samples to {output_path}")
+        return
+
+    mask = base_mask.to(device)
+    target_batched = guidance_target.unsqueeze(0).repeat(args.samples, 1, 1).to(device)
+    mask_batched = mask.unsqueeze(0).repeat(args.samples, 1, 1, 1).to(device)
     guidance = ForecastGuidance(
         forecaster=forecaster,
         target=target_batched,
@@ -1316,13 +1551,6 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         anchor_weights=anchor_weights,
         node_weights=node_weights,
         model_type=model_type,
-    )
-
-    generator = CounterfactualGenerator(
-        diffusion,
-        adjacency=bundle.adjacency.to(device),
-        device=device,
-        temporal_context=build_temporal_context(dataset_meta["lag"], device),
     )
 
     warm_start = None

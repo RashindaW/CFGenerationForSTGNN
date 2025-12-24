@@ -166,6 +166,8 @@ class DiffusionModel(nn.Module):
         temporal_context: Optional[torch.Tensor] = None,
         max_steps: Optional[int] = None,
         initial_x: Optional[torch.Tensor] = None,
+        edit_mask: Optional[torch.Tensor] = None,
+        fixed_values: Optional[torch.Tensor] = None,
         progress_callback: Optional[Callable[[int, torch.Tensor], None]] = None,
     ) -> torch.Tensor:
         device = self.betas.device
@@ -173,8 +175,24 @@ class DiffusionModel(nn.Module):
             x = initial_x.to(device)
         else:
             x = torch.randn(shape, device=device)
+        if edit_mask is not None:
+            if fixed_values is None:
+                raise ValueError("fixed_values must be provided when edit_mask is set.")
+            edit_mask = edit_mask.to(device)
+            fixed_values = fixed_values.to(device)
+            if edit_mask.dim() == len(shape) - 1:
+                edit_mask = edit_mask.unsqueeze(0)
+            if fixed_values.dim() == len(shape) - 1:
+                fixed_values = fixed_values.unsqueeze(0)
+            if edit_mask.size(0) == 1 and shape[0] > 1:
+                edit_mask = edit_mask.expand(shape[0], *edit_mask.shape[1:])
+            if fixed_values.size(0) == 1 and shape[0] > 1:
+                fixed_values = fixed_values.expand(shape[0], *fixed_values.shape[1:])
+            x = edit_mask * x + (1.0 - edit_mask) * fixed_values
         for idx, timestep in enumerate(self._build_reverse_schedule(max_steps)):
             x = self.p_sample(x, timestep, adjacency=adjacency, guidance=guidance, temporal_context=temporal_context)
+            if edit_mask is not None and fixed_values is not None:
+                x = edit_mask * x + (1.0 - edit_mask) * fixed_values
             if progress_callback is not None:
                 progress_callback(idx, x)
         return x

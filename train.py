@@ -52,6 +52,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpus", type=str, default=None, help="Comma-separated CUDA device IDs, e.g., '0,1'.")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--target_channel", type=int, default=0, help="Feature channel to forecast.")
+    parser.add_argument(
+        "--loss_focus",
+        type=str,
+        choices=["full", "last"],
+        default="full",
+        help="Compute loss/metrics over the full horizon or only the final step.",
+    )
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--output", type=str, default=None, help="Optional path to save trained weights.")
@@ -298,6 +305,7 @@ def run_epoch(
     device: torch.device,
     model_type: str,
     criterion: torch.nn.Module,
+    loss_focus: str = "full",
     optimizer: torch.optim.Optimizer | None = None,
     grad_clip: float | None = None,
     distributed: bool = False,
@@ -317,6 +325,9 @@ def run_epoch(
             optimizer.zero_grad()
         with torch.set_grad_enabled(is_train):
             prediction = forward_pass(model, x, model_type)
+            if loss_focus == "last":
+                prediction = prediction[..., -1:]
+                target = target[..., -1:]
             loss = criterion(prediction, target)
             if is_train:
                 loss.backward()
@@ -470,7 +481,8 @@ def test_pipeline(args: argparse.Namespace) -> None:
 
     criterion = nn.L1Loss()
     pbar = tqdm.tqdm(total=1, desc="Testing Progress")
-    test_stats = run_epoch(model, loaders["test"], device, model_type, criterion)
+    loss_focus = checkpoint_args.get("loss_focus", "full") if checkpoint_args else "full"
+    test_stats = run_epoch(model, loaders["test"], device, model_type, criterion, loss_focus=loss_focus)
     pbar.update(1)
     pbar.close()
     print(
@@ -537,6 +549,7 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             device,
             args.model,
             criterion,
+            loss_focus=args.loss_focus,
             optimizer=optimizer,
             grad_clip=args.grad_clip,
             distributed=distributed,
@@ -547,6 +560,7 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             device,
             args.model,
             criterion,
+            loss_focus=args.loss_focus,
             distributed=distributed,
         )
 
