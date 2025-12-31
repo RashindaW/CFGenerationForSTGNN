@@ -9,7 +9,7 @@ import shlex
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -388,6 +388,13 @@ def write_training_command_file(directory: Path, filename: str = "trainingComman
     return command_path
 
 
+def safe_torch_load(path: Path, device: torch.device) -> Dict[str, Any]:
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
 def save_checkpoint(
     path: Path,
     args: argparse.Namespace,
@@ -438,7 +445,7 @@ def test_pipeline(args: argparse.Namespace) -> None:
 
     gpu_ids = getattr(args, "gpu_ids", None)
     device = resolve_device(args.device, gpu_ids)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = safe_torch_load(checkpoint_path, device)
 
     checkpoint_args = checkpoint.get("config", {}).get("args", {})
     model_args = argparse.Namespace(**checkpoint_args) if checkpoint_args else argparse.Namespace()

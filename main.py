@@ -181,6 +181,11 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         default=None,
         help="Number of iterative steps (defaults to cf_horizon).",
     )
+    parser.add_argument(
+        "--iterative_future_only",
+        action="store_true",
+        help="Only edit the next future step; keep all observed lag values fixed.",
+    )
     parser.add_argument("--lambda_scale", type=float, default=1.0)
     parser.add_argument("--eta", type=float, default=0.05)
     parser.add_argument("--temporal_weight", type=float, default=1e-3)
@@ -423,6 +428,13 @@ def write_training_command_file(directory: Path, filename: str = "trainingComman
     return command_path
 
 
+def safe_torch_load(path: Path, device: torch.device) -> Dict[str, Any]:
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
 def save_diffusion_checkpoint(
     path: Path,
     epoch: int,
@@ -449,7 +461,7 @@ def save_diffusion_checkpoint(
 
 
 def load_diffusion_checkpoint(path: Path, device: torch.device, gpu_ids: Optional[List[int]] = None) -> Tuple[DiffusionModel, Dict[str, Any]]:
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = safe_torch_load(path, device)
     config = DiffusionConfig(**checkpoint["config"])
     model_meta = checkpoint["model_meta"]
     network = SpatioTemporalUNet(
@@ -515,7 +527,7 @@ def run_diffusion_command(args: argparse.Namespace) -> None:
     best_val = float("inf")
     start_epoch = 1
     if args.checkpoint:
-        ckpt = torch.load(Path(args.checkpoint), map_location=device)
+        ckpt = safe_torch_load(Path(args.checkpoint), device)
         diffusion.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         start_epoch = ckpt.get("epoch", 0) + 1
@@ -1165,7 +1177,7 @@ def select_split_dataset(bundle: TemporalDatasetBundle, split: str):
 
 
 def load_forecaster_from_checkpoint(path: Path, device: torch.device, data_root_override: Optional[Path] = None) -> Tuple[torch.nn.Module, TemporalDatasetBundle, Dict[str, Any]]:
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = safe_torch_load(path, device)
     checkpoint_args = checkpoint.get("config", {}).get("args", {})
 
     dataset_name = checkpoint.get("dataset") or checkpoint_args.get("dataset")
@@ -1357,10 +1369,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         if iter_steps > cf_horizon:
             raise ValueError(f"iterative_steps {iter_steps} exceeds cf_horizon {cf_horizon}")
 
-        edit_mask = torch.zeros_like(base_mask)
-        edit_mask[-1] = 1.0
-        edit_mask = edit_mask * base_mask
-        edit_mask = edit_mask.to(device)
+        future_only = args.iterative_future_only
 
         node_w = node_weights.to(device) if node_weights is not None else torch.ones(bundle.num_nodes, device=device)
         node_w = node_w / node_w.sum().clamp(min=1e-8)
@@ -1370,63 +1379,151 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         mse_per_step: list[float] = []
         best_indices: list[int] = []
         iterative_predictions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
+        iterative_actions = None
 
-        for step in range(iter_steps):
-            step_target = guidance_target[:, step : step + 1].to(device)
-            target_batched = step_target.unsqueeze(0).repeat(args.samples, 1, 1)
-            mask_batched = edit_mask.unsqueeze(0).repeat(args.samples, 1, 1, 1)
+        if future_only:
+            guidance_target_device = guidance_target.to(device)
+            iterative_actions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
+            edit_mask = torch.zeros_like(base_mask)
+            edit_mask[-1] = 1.0
+            edit_mask = edit_mask * base_mask
+            edit_mask = edit_mask.to(device)
 
-            baseline_step = baseline_forecast[:, step : step + 1] if baseline_forecast is not None else None
-            anchor_step = anchor_weights[step : step + 1] if anchor_weights is not None else None
-            guidance = ForecastGuidance(
-                forecaster=short_forecaster,
-                target=target_batched,
-                mask=mask_batched,
-                adjacency=bundle.adjacency.to(device),
-                config=guidance_config,
-                lower_bounds=args.lower_bound,
-                upper_bounds=args.upper_bound,
-                baseline=baseline_step,
-                anchor_weights=anchor_step,
-                node_weights=node_weights,
-                model_type=short_model_type,
-            )
+            for step in range(iter_steps):
+                proposal_window = torch.cat([current_window[1:], current_window[-1:].clone()], dim=0)
+                if 0 <= target_ch < proposal_window.shape[-1]:
+                    proposal_window[-1, :, target_ch] = guidance_target_device[:, step]
+                    iterative_actions[:, step] = guidance_target_device[:, step]
 
-            fixed_values = current_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
-            warm_start = fixed_values if args.warm_start else None
-            samples = generator.generate(
-                sample_shape=sample_shape,
-                guidance=guidance,
-                num_samples=args.samples,
-                max_steps=args.max_steps,
-                warm_start=warm_start,
-                edit_mask=mask_batched,
-                fixed_values=fixed_values,
-            )
+                step_mask = edit_mask.clone()
+                if 0 <= target_ch < proposal_window.shape[-1]:
+                    step_mask[-1, :, target_ch] = 0.0
 
-            with torch.no_grad():
-                cf_input = prepare_forecaster_input(samples)
-                cf_preds = forecaster_module.forward_pass(short_forecaster, cf_input, short_model_type)
-                if cf_preds.dim() == 2:
-                    cf_preds = cf_preds.unsqueeze(-1)
-                cf_preds = cf_preds[:, :, :1]
-                diff_sq = (cf_preds - target_batched) ** 2
-                per_node = diff_sq.mean(dim=2)
-                mse = (per_node * node_w.view(1, -1)).sum(dim=1)
+                if step >= iter_steps - 1:
+                    best_window = proposal_window
+                    best_windows.append(best_window.detach().cpu())
+                    current_window = best_window
+                    continue
 
-            best_idx = int(torch.argmin(mse).item())
-            best_indices.append(best_idx)
-            best_pred = cf_preds[best_idx]
-            iterative_predictions[:, step] = best_pred.squeeze(-1)
-            mse_per_step.append(float(mse[best_idx].item()))
+                next_target = guidance_target_device[:, step + 1 : step + 2]
+                target_batched = next_target.unsqueeze(0).repeat(args.samples, 1, 1)
+                mask_batched = step_mask.unsqueeze(0).repeat(args.samples, 1, 1, 1)
 
-            best_window = samples[best_idx]
-            best_windows.append(best_window.detach().cpu())
+                baseline_step = baseline_forecast[:, step + 1 : step + 2] if baseline_forecast is not None else None
+                anchor_step = anchor_weights[step + 1 : step + 2] if anchor_weights is not None else None
+                guidance = ForecastGuidance(
+                    forecaster=short_forecaster,
+                    target=target_batched,
+                    mask=mask_batched,
+                    adjacency=bundle.adjacency.to(device),
+                    config=guidance_config,
+                    lower_bounds=args.lower_bound,
+                    upper_bounds=args.upper_bound,
+                    baseline=baseline_step,
+                    anchor_weights=anchor_step,
+                    node_weights=node_weights,
+                    model_type=short_model_type,
+                )
 
-            next_step = best_window[-1].clone()
-            if 0 <= target_ch < next_step.shape[-1]:
-                next_step[:, target_ch] = best_pred.squeeze(-1)
-            current_window = torch.cat([best_window[1:], next_step.unsqueeze(0)], dim=0)
+                fixed_values = proposal_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
+                warm_start = fixed_values if args.warm_start else None
+                if float(step_mask.max().item()) <= 0:
+                    samples = fixed_values
+                else:
+                    samples = generator.generate(
+                        sample_shape=sample_shape,
+                        guidance=guidance,
+                        num_samples=args.samples,
+                        max_steps=args.max_steps,
+                        warm_start=warm_start,
+                        edit_mask=mask_batched,
+                        fixed_values=fixed_values,
+                    )
+
+                with torch.no_grad():
+                    cf_input = prepare_forecaster_input(samples)
+                    cf_preds = forecaster_module.forward_pass(short_forecaster, cf_input, short_model_type)
+                    if cf_preds.dim() == 2:
+                        cf_preds = cf_preds.unsqueeze(-1)
+                    cf_preds = cf_preds[:, :, :1]
+                    diff_sq = (cf_preds - target_batched) ** 2
+                    per_node = diff_sq.mean(dim=2)
+                    mse = (per_node * node_w.view(1, -1)).sum(dim=1)
+
+                best_idx = int(torch.argmin(mse).item())
+                best_indices.append(best_idx)
+                best_pred = cf_preds[best_idx]
+                iterative_predictions[:, step + 1] = best_pred.squeeze(-1)
+                mse_per_step.append(float(mse[best_idx].item()))
+
+                best_window = samples[best_idx]
+                best_windows.append(best_window.detach().cpu())
+                current_window = best_window
+
+            if iter_steps > 0 and iterative_actions is not None:
+                iterative_predictions[:, 0] = iterative_actions[:, 0]
+        else:
+            edit_mask = torch.zeros_like(base_mask)
+            edit_mask[-1] = 1.0
+            edit_mask = edit_mask * base_mask
+            edit_mask = edit_mask.to(device)
+
+            for step in range(iter_steps):
+                step_target = guidance_target[:, step : step + 1].to(device)
+                target_batched = step_target.unsqueeze(0).repeat(args.samples, 1, 1)
+                mask_batched = edit_mask.unsqueeze(0).repeat(args.samples, 1, 1, 1)
+
+                baseline_step = baseline_forecast[:, step : step + 1] if baseline_forecast is not None else None
+                anchor_step = anchor_weights[step : step + 1] if anchor_weights is not None else None
+                guidance = ForecastGuidance(
+                    forecaster=short_forecaster,
+                    target=target_batched,
+                    mask=mask_batched,
+                    adjacency=bundle.adjacency.to(device),
+                    config=guidance_config,
+                    lower_bounds=args.lower_bound,
+                    upper_bounds=args.upper_bound,
+                    baseline=baseline_step,
+                    anchor_weights=anchor_step,
+                    node_weights=node_weights,
+                    model_type=short_model_type,
+                )
+
+                fixed_values = current_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
+                warm_start = fixed_values if args.warm_start else None
+                samples = generator.generate(
+                    sample_shape=sample_shape,
+                    guidance=guidance,
+                    num_samples=args.samples,
+                    max_steps=args.max_steps,
+                    warm_start=warm_start,
+                    edit_mask=mask_batched,
+                    fixed_values=fixed_values,
+                )
+
+                with torch.no_grad():
+                    cf_input = prepare_forecaster_input(samples)
+                    cf_preds = forecaster_module.forward_pass(short_forecaster, cf_input, short_model_type)
+                    if cf_preds.dim() == 2:
+                        cf_preds = cf_preds.unsqueeze(-1)
+                    cf_preds = cf_preds[:, :, :1]
+                    diff_sq = (cf_preds - target_batched) ** 2
+                    per_node = diff_sq.mean(dim=2)
+                    mse = (per_node * node_w.view(1, -1)).sum(dim=1)
+
+                best_idx = int(torch.argmin(mse).item())
+                best_indices.append(best_idx)
+                best_pred = cf_preds[best_idx]
+                iterative_predictions[:, step] = best_pred.squeeze(-1)
+                mse_per_step.append(float(mse[best_idx].item()))
+
+                best_window = samples[best_idx]
+                best_windows.append(best_window.detach().cpu())
+
+                next_step = best_window[-1].clone()
+                if 0 <= target_ch < next_step.shape[-1]:
+                    next_step[:, target_ch] = best_pred.squeeze(-1)
+                current_window = torch.cat([best_window[1:], next_step.unsqueeze(0)], dim=0)
 
         iterative_predictions_cpu = iterative_predictions.detach().cpu()
         final_window = current_window.detach().cpu()
@@ -1517,6 +1614,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             "best_counterfactual_window": final_window,
             "cf_horizon": cf_horizon,
             "iterative_steps": iter_steps,
+            "iterative_future_only": args.iterative_future_only,
             "anchor_weights": anchor_weights,
             "anchor_release_power": args.anchor_release_power,
             "guidance_target": guidance_slice,
@@ -1524,6 +1622,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             "iterative": {
                 "predictions": iterative_predictions_cpu,
                 "targets": guidance_slice if guidance_slice is not None else None,
+                "actions": iterative_actions.detach().cpu() if iterative_actions is not None else None,
                 "mse_per_step": torch.tensor(mse_per_step, dtype=torch.float32),
                 "best_indices": best_indices,
                 "best_windows": torch.stack(best_windows) if best_windows else None,
