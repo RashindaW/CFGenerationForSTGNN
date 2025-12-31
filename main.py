@@ -1068,7 +1068,6 @@ def save_prediction_plot(
 
     plot_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(8, 4))
-    plt.plot(steps, original_prediction[node_index].detach().cpu().numpy(), label="Original forecast", linewidth=2)
     plt.plot(
         steps,
         cf_prediction[node_index].detach().cpu().numpy(),
@@ -1166,6 +1165,87 @@ def save_top_cf_window_plot(
     fig.savefig(plot_path, dpi=200)
     plt.close(fig)
     print(f"Saved top-k past-window plot to {plot_path}")
+
+
+def save_iterative_cf_window_plots(
+    plot_path: Path,
+    lag_values: torch.Tensor,
+    horizon_ground_truth: torch.Tensor,
+    horizon_counterfactual: torch.Tensor,
+    target_node: int,
+    per_page: int = 10,
+    ncols: int = 5,
+) -> List[Path]:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib is not available; skipping iterative counterfactual plots.")
+        return []
+
+    if lag_values.dim() != 2:
+        raise ValueError(f"lag_values must be (lag, nodes); got {lag_values.shape}")
+    if horizon_ground_truth.dim() != 2 or horizon_counterfactual.dim() != 2:
+        raise ValueError("horizon_ground_truth and horizon_counterfactual must be (nodes, horizon)")
+    if horizon_ground_truth.shape != horizon_counterfactual.shape:
+        raise ValueError("ground-truth and counterfactual horizons must have the same shape")
+    if lag_values.shape[1] != horizon_ground_truth.shape[0]:
+        raise ValueError("lag_values node count must match horizon node count")
+
+    lag_len, num_nodes = lag_values.shape
+    horizon_len = horizon_ground_truth.shape[1]
+    nodes = list(range(num_nodes))
+    if 0 <= target_node < num_nodes:
+        nodes.remove(target_node)
+
+    per_page = max(1, int(per_page))
+    ncols = max(1, int(ncols))
+    pages = math.ceil(len(nodes) / per_page)
+    saved_paths: List[Path] = []
+
+    lag_steps = np.arange(-lag_len + 1, 1)
+    horizon_steps = np.arange(1, horizon_len + 1)
+    full_steps = np.concatenate([lag_steps, horizon_steps])
+
+    for page_idx in range(pages):
+        page_nodes = nodes[page_idx * per_page : (page_idx + 1) * per_page]
+        if not page_nodes:
+            continue
+        nrows = math.ceil(len(page_nodes) / ncols)
+        fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4, nrows * 3), sharex=True)
+        axes = np.array(axes).reshape(-1)
+
+        for ax, node in zip(axes, page_nodes):
+            lag_series = lag_values[:, node].detach().cpu().numpy()
+            gt_series = horizon_ground_truth[node].detach().cpu().numpy()
+            cf_series = horizon_counterfactual[node].detach().cpu().numpy()
+            gt_full = np.concatenate([lag_series, gt_series])
+
+            ax.plot(full_steps, gt_full, color="green", linestyle=":", linewidth=2, label="Ground truth")
+            ax.plot(horizon_steps, cf_series, linewidth=3, label="Counterfactual")
+            ax.set_title(f"Node {node}")
+            ax.grid(True, alpha=0.3)
+
+        for ax in axes[len(page_nodes) :]:
+            ax.axis("off")
+
+        axes[0].legend()
+        title = "Counterfactual horizon vs ground truth (excluding target node)"
+        fig.suptitle(title, y=1.02)
+        fig.tight_layout()
+
+        if pages == 1:
+            save_path = plot_path
+        elif page_idx == 0:
+            save_path = plot_path
+        else:
+            save_path = plot_path.with_name(f"{plot_path.stem}_page{page_idx + 1}{plot_path.suffix}")
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=200)
+        plt.close(fig)
+        saved_paths.append(save_path)
+        print(f"Saved iterative counterfactual plot to {save_path}")
+
+    return saved_paths
 
 
 def select_split_dataset(bundle: TemporalDatasetBundle, split: str):
@@ -1559,18 +1639,22 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             )
 
         top_window_plot_path = Path(args.plot_top_cf_window_path) if args.plot_top_cf_window_path else None
-        if top_window_plot_path is not None and best_windows:
-            past_plot = past_window.detach().cpu().float()
-            best_cf_window_plot = best_windows[0]
-            if args.plot_top_cf_window_feature == target_ch:
-                past_plot = inverse_target_feature(past_plot, target_ch, bundle.scaler)
-                best_cf_window_plot = inverse_target_feature(best_cf_window_plot, target_ch, bundle.scaler)
-            save_top_cf_window_plot(
+        top_window_plot_paths: Optional[List[Path]] = None
+        if top_window_plot_path is not None:
+            lag_values = past_window[:, :, target_ch].permute(1, 0).contiguous().cpu()
+            lag_values = inverse_target_scale(lag_values, bundle.scaler).permute(1, 0)
+            horizon_ground_truth = truncate_horizon(target_future, iter_steps).cpu()
+            horizon_ground_truth = inverse_target_scale(horizon_ground_truth, bundle.scaler)
+            horizon_counterfactual = iterative_predictions_cpu[:, :iter_steps]
+            horizon_counterfactual = inverse_target_scale(horizon_counterfactual, bundle.scaler)
+            top_window_plot_paths = save_iterative_cf_window_plots(
                 top_window_plot_path,
-                past_plot,
-                best_cf_window_plot,
-                top_k=args.plot_top_cf_window_k,
-                feature=args.plot_top_cf_window_feature,
+                lag_values,
+                horizon_ground_truth,
+                horizon_counterfactual,
+                target_node=args.target_adjust_node,
+                per_page=10,
+                ncols=5,
             )
 
         output = {
@@ -1608,6 +1692,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             "use_predicted_target": args.use_predicted_target,
             "plot_path": str(plot_path),
             "top_cf_window_plot_path": str(top_window_plot_path) if top_window_plot_path else None,
+            "top_cf_window_plot_paths": [str(path) for path in top_window_plot_paths] if top_window_plot_paths else None,
             "counterfactual_mse": None,
             "best_sample_index": None,
             "best_counterfactual_prediction": iterative_predictions_cpu,
