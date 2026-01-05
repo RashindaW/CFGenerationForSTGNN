@@ -181,11 +181,6 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         default=None,
         help="Number of iterative steps (defaults to cf_horizon).",
     )
-    parser.add_argument(
-        "--iterative_future_only",
-        action="store_true",
-        help="Only edit the next future step; keep all observed lag values fixed.",
-    )
     parser.add_argument("--lambda_scale", type=float, default=1.0)
     parser.add_argument("--eta", type=float, default=0.05)
     parser.add_argument("--temporal_weight", type=float, default=1e-3)
@@ -284,6 +279,31 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         type=int,
         default=None,
         help="Number of lagged time steps to plot (from most recent backwards). If None, plots all available lag steps.",
+    )
+    parser.add_argument(
+        "--metrics_path",
+        type=str,
+        default=None,
+        help="Optional path to save iterative counterfactual metrics CSV (defaults to <output_path>_metrics.csv).",
+    )
+    parser.add_argument(
+        "--metrics_plot_path",
+        type=str,
+        default=None,
+        help="Optional path to save iterative counterfactual metrics plot (defaults to <output_path>_metrics.png).",
+    )
+    parser.add_argument(
+        "--metrics_eps",
+        type=float,
+        default=1e-6,
+        help="Absolute-change threshold for counting edited nodes in metrics.",
+    )
+    parser.add_argument(
+        "--metrics_input",
+        type=str,
+        choices=["baseline", "guidance", "adjusted", "original", "actions"],
+        default="baseline",
+        help="Which series to treat as the input for metrics in iterative guidance.",
     )
     parser.add_argument(
         "--guidance_start_source",
@@ -1034,6 +1054,169 @@ def truncate_horizon(tensor: torch.Tensor, horizon: Optional[int]) -> torch.Tens
     return tensor[:, :horizon].contiguous()
 
 
+def select_metrics_input(
+    source: str,
+    baseline: Optional[torch.Tensor],
+    guidance: Optional[torch.Tensor],
+    adjusted: Optional[torch.Tensor],
+    original: Optional[torch.Tensor],
+    actions: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    options = {
+        "baseline": baseline,
+        "guidance": guidance,
+        "adjusted": adjusted,
+        "original": original,
+        "actions": actions,
+    }
+    selected = options.get(source)
+    if selected is None:
+        print(f"Metrics input '{source}' is not available; skipping metrics.")
+    return selected
+
+
+def build_counterfactual_metrics(
+    input_series: torch.Tensor,
+    output_series: torch.Tensor,
+    eps: float,
+) -> Dict[str, Any]:
+    if input_series.shape != output_series.shape:
+        raise ValueError(
+            f"Metrics shape mismatch: input {tuple(input_series.shape)} vs output {tuple(output_series.shape)}"
+        )
+    if input_series.dim() != 2:
+        raise ValueError("Metrics inputs must be shaped (nodes, steps)")
+
+    input_series = input_series.detach().cpu().float()
+    output_series = output_series.detach().cpu().float()
+    steps = output_series.shape[1]
+
+    diff = output_series - input_series
+    abs_diff = diff.abs()
+    changed_vs_input = (abs_diff > eps).sum(dim=0).to(torch.int64)
+    l2_vs_input = torch.sqrt((diff ** 2).sum(dim=0))
+    avg_l2_vs_input = torch.where(
+        changed_vs_input > 0,
+        l2_vs_input / changed_vs_input.to(l2_vs_input.dtype),
+        torch.zeros_like(l2_vs_input),
+    )
+
+    if steps > 1:
+        diff_prev = output_series[:, 1:] - output_series[:, :-1]
+        abs_prev = diff_prev.abs()
+        changed_vs_prev = torch.zeros(steps, dtype=torch.int64)
+        changed_vs_prev[0] = changed_vs_input[0]
+        changed_vs_prev[1:] = (abs_prev > eps).sum(dim=0).to(torch.int64)
+        l2_vs_prev = torch.zeros(steps, dtype=l2_vs_input.dtype)
+        l2_vs_prev[0] = l2_vs_input[0]
+        l2_vs_prev[1:] = torch.sqrt((diff_prev ** 2).sum(dim=0))
+    else:
+        changed_vs_prev = changed_vs_input.clone()
+        l2_vs_prev = l2_vs_input.clone()
+
+    avg_l2_vs_prev = torch.where(
+        changed_vs_prev > 0,
+        l2_vs_prev / changed_vs_prev.to(l2_vs_prev.dtype),
+        torch.zeros_like(l2_vs_prev),
+    )
+
+    total_changed_vs_input = int(changed_vs_input.sum().item())
+    total_changed_vs_prev = int(changed_vs_prev.sum().item())
+    total_l2_vs_input = float(l2_vs_input.sum().item())
+    total_l2_vs_prev = float(l2_vs_prev.sum().item())
+    total_avg_l2_vs_input = total_l2_vs_input / total_changed_vs_input if total_changed_vs_input > 0 else 0.0
+    total_avg_l2_vs_prev = total_l2_vs_prev / total_changed_vs_prev if total_changed_vs_prev > 0 else 0.0
+
+    rows = []
+    for idx in range(steps):
+        rows.append(
+            {
+                "step": idx + 1,
+                "changed_nodes_vs_input": int(changed_vs_input[idx].item()),
+                "changed_nodes_vs_prev": int(changed_vs_prev[idx].item()),
+                "l2_vs_input": float(l2_vs_input[idx].item()),
+                "avg_l2_per_changed_vs_input": float(avg_l2_vs_input[idx].item()),
+                "l2_vs_prev": float(l2_vs_prev[idx].item()),
+                "avg_l2_per_changed_vs_prev": float(avg_l2_vs_prev[idx].item()),
+            }
+        )
+
+    summary = {
+        "step": "total",
+        "changed_nodes_vs_input": total_changed_vs_input,
+        "changed_nodes_vs_prev": total_changed_vs_prev,
+        "l2_vs_input": total_l2_vs_input,
+        "avg_l2_per_changed_vs_input": total_avg_l2_vs_input,
+        "l2_vs_prev": total_l2_vs_prev,
+        "avg_l2_per_changed_vs_prev": total_avg_l2_vs_prev,
+    }
+
+    return {
+        "steps": list(range(1, steps + 1)),
+        "rows": rows,
+        "summary": summary,
+        "changed_vs_input": changed_vs_input,
+        "changed_vs_prev": changed_vs_prev,
+        "l2_vs_input": l2_vs_input,
+        "l2_vs_prev": l2_vs_prev,
+        "avg_l2_vs_input": avg_l2_vs_input,
+    }
+
+
+def save_counterfactual_metrics_csv(metrics_path: Path, metrics: Dict[str, Any]) -> None:
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "step",
+        "changed_nodes_vs_input",
+        "changed_nodes_vs_prev",
+        "l2_vs_input",
+        "avg_l2_per_changed_vs_input",
+        "l2_vs_prev",
+        "avg_l2_per_changed_vs_prev",
+    ]
+    with metrics_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in metrics["rows"]:
+            writer.writerow(row)
+        writer.writerow(metrics["summary"])
+    print(f"Saved counterfactual metrics table to {metrics_path}")
+
+
+def save_counterfactual_metrics_plot(metrics_plot_path: Path, metrics: Dict[str, Any]) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib is not available; skipping counterfactual metrics plot.")
+        return
+
+    steps = metrics["steps"]
+    changed_vs_input = metrics["changed_vs_input"].detach().cpu().numpy()
+    changed_vs_prev = metrics["changed_vs_prev"].detach().cpu().numpy()
+    l2_vs_input = metrics["l2_vs_input"].detach().cpu().numpy()
+    avg_l2_vs_input = metrics["avg_l2_vs_input"].detach().cpu().numpy()
+
+    fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    axes[0].plot(steps, changed_vs_input, marker="o", label="Changed vs input")
+    axes[0].plot(steps, changed_vs_prev, marker="s", label="Changed vs previous")
+    axes[0].set_ylabel("Changed nodes")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(steps, l2_vs_input, marker="o", label="L2 vs input")
+    axes[1].plot(steps, avg_l2_vs_input, marker="s", label="Avg L2 per changed")
+    axes[1].set_xlabel("Iterative step")
+    axes[1].set_ylabel("L2 distance")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    fig.tight_layout()
+    metrics_plot_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(metrics_plot_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved counterfactual metrics plot to {metrics_plot_path}")
+
+
 def save_prediction_plot(
     plot_path: Path,
     node_index: int,
@@ -1449,8 +1632,6 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         if iter_steps > cf_horizon:
             raise ValueError(f"iterative_steps {iter_steps} exceeds cf_horizon {cf_horizon}")
 
-        future_only = args.iterative_future_only
-
         node_w = node_weights.to(device) if node_weights is not None else torch.ones(bundle.num_nodes, device=device)
         node_w = node_w / node_w.sum().clamp(min=1e-8)
 
@@ -1459,153 +1640,89 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         mse_per_step: list[float] = []
         best_indices: list[int] = []
         iterative_predictions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
-        iterative_actions = None
+        iterative_actions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
+        iterative_targets = torch.zeros((bundle.num_nodes, iter_steps), device=device)
+        target_series = default_target.to(device)
 
-        if future_only:
-            guidance_target_device = guidance_target.to(device)
-            iterative_actions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
-            edit_mask = torch.zeros_like(base_mask)
-            edit_mask[-1] = 1.0
-            edit_mask = edit_mask * base_mask
-            edit_mask = edit_mask.to(device)
+        edit_mask = torch.zeros_like(base_mask)
+        edit_mask[-1] = 1.0
+        edit_mask = edit_mask * base_mask
+        edit_mask = edit_mask.to(device)
 
-            for step in range(iter_steps):
-                proposal_window = torch.cat([current_window[1:], current_window[-1:].clone()], dim=0)
-                if 0 <= target_ch < proposal_window.shape[-1]:
-                    proposal_window[-1, :, target_ch] = guidance_target_device[:, step]
-                    iterative_actions[:, step] = guidance_target_device[:, step]
+        for step in range(iter_steps):
+            with torch.no_grad():
+                step_input = prepare_forecaster_input(current_window.unsqueeze(0))
+                step_pred = forecaster_module.forward_pass(short_forecaster, step_input, short_model_type)
+                if step_pred.dim() == 2:
+                    step_pred = step_pred.unsqueeze(-1)
+                step_pred = step_pred[:, :, :1]
+            step_pred = step_pred.squeeze(0)
+            iterative_actions[:, step] = step_pred.squeeze(-1)
 
-                step_mask = edit_mask.clone()
-                if 0 <= target_ch < proposal_window.shape[-1]:
-                    step_mask[-1, :, target_ch] = 0.0
+            if args.target_adjust_node < 0:
+                step_target = target_series[:, step : step + 1]
+            else:
+                step_target = step_pred.clone()
+                step_target[args.target_adjust_node, 0] = target_series[args.target_adjust_node, step]
+            iterative_targets[:, step] = step_target.squeeze(-1)
 
-                if step >= iter_steps - 1:
-                    best_window = proposal_window
-                    best_windows.append(best_window.detach().cpu())
-                    current_window = best_window
-                    continue
+            target_batched = step_target.unsqueeze(0).repeat(args.samples, 1, 1)
+            mask_batched = edit_mask.unsqueeze(0).repeat(args.samples, 1, 1, 1)
 
-                next_target = guidance_target_device[:, step + 1 : step + 2]
-                target_batched = next_target.unsqueeze(0).repeat(args.samples, 1, 1)
-                mask_batched = step_mask.unsqueeze(0).repeat(args.samples, 1, 1, 1)
+            baseline_step = step_pred
+            anchor_step = anchor_weights[step : step + 1] if anchor_weights is not None else None
+            guidance = ForecastGuidance(
+                forecaster=short_forecaster,
+                target=target_batched,
+                mask=mask_batched,
+                adjacency=bundle.adjacency.to(device),
+                config=guidance_config,
+                lower_bounds=args.lower_bound,
+                upper_bounds=args.upper_bound,
+                baseline=baseline_step,
+                anchor_weights=anchor_step,
+                node_weights=node_weights,
+                model_type=short_model_type,
+            )
 
-                baseline_step = baseline_forecast[:, step + 1 : step + 2] if baseline_forecast is not None else None
-                anchor_step = anchor_weights[step + 1 : step + 2] if anchor_weights is not None else None
-                guidance = ForecastGuidance(
-                    forecaster=short_forecaster,
-                    target=target_batched,
-                    mask=mask_batched,
-                    adjacency=bundle.adjacency.to(device),
-                    config=guidance_config,
-                    lower_bounds=args.lower_bound,
-                    upper_bounds=args.upper_bound,
-                    baseline=baseline_step,
-                    anchor_weights=anchor_step,
-                    node_weights=node_weights,
-                    model_type=short_model_type,
-                )
+            fixed_values = current_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
+            warm_start = fixed_values if args.warm_start else None
+            samples = generator.generate(
+                sample_shape=sample_shape,
+                guidance=guidance,
+                num_samples=args.samples,
+                max_steps=args.max_steps,
+                warm_start=warm_start,
+                edit_mask=mask_batched,
+                fixed_values=fixed_values,
+            )
 
-                fixed_values = proposal_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
-                warm_start = fixed_values if args.warm_start else None
-                if float(step_mask.max().item()) <= 0:
-                    samples = fixed_values
-                else:
-                    samples = generator.generate(
-                        sample_shape=sample_shape,
-                        guidance=guidance,
-                        num_samples=args.samples,
-                        max_steps=args.max_steps,
-                        warm_start=warm_start,
-                        edit_mask=mask_batched,
-                        fixed_values=fixed_values,
-                    )
+            with torch.no_grad():
+                cf_input = prepare_forecaster_input(samples)
+                cf_preds = forecaster_module.forward_pass(short_forecaster, cf_input, short_model_type)
+                if cf_preds.dim() == 2:
+                    cf_preds = cf_preds.unsqueeze(-1)
+                cf_preds = cf_preds[:, :, :1]
+                diff_sq = (cf_preds - target_batched) ** 2
+                per_node = diff_sq.mean(dim=2)
+                mse = (per_node * node_w.view(1, -1)).sum(dim=1)
 
-                with torch.no_grad():
-                    cf_input = prepare_forecaster_input(samples)
-                    cf_preds = forecaster_module.forward_pass(short_forecaster, cf_input, short_model_type)
-                    if cf_preds.dim() == 2:
-                        cf_preds = cf_preds.unsqueeze(-1)
-                    cf_preds = cf_preds[:, :, :1]
-                    diff_sq = (cf_preds - target_batched) ** 2
-                    per_node = diff_sq.mean(dim=2)
-                    mse = (per_node * node_w.view(1, -1)).sum(dim=1)
+            best_idx = int(torch.argmin(mse).item())
+            best_indices.append(best_idx)
+            best_pred = cf_preds[best_idx]
+            iterative_predictions[:, step] = best_pred.squeeze(-1)
+            mse_per_step.append(float(mse[best_idx].item()))
 
-                best_idx = int(torch.argmin(mse).item())
-                best_indices.append(best_idx)
-                best_pred = cf_preds[best_idx]
-                iterative_predictions[:, step + 1] = best_pred.squeeze(-1)
-                mse_per_step.append(float(mse[best_idx].item()))
+            best_window = samples[best_idx]
+            best_windows.append(best_window.detach().cpu())
 
-                best_window = samples[best_idx]
-                best_windows.append(best_window.detach().cpu())
-                current_window = best_window
-
-            if iter_steps > 0 and iterative_actions is not None:
-                iterative_predictions[:, 0] = iterative_actions[:, 0]
-        else:
-            edit_mask = torch.zeros_like(base_mask)
-            edit_mask[-1] = 1.0
-            edit_mask = edit_mask * base_mask
-            edit_mask = edit_mask.to(device)
-
-            for step in range(iter_steps):
-                step_target = guidance_target[:, step : step + 1].to(device)
-                target_batched = step_target.unsqueeze(0).repeat(args.samples, 1, 1)
-                mask_batched = edit_mask.unsqueeze(0).repeat(args.samples, 1, 1, 1)
-
-                baseline_step = baseline_forecast[:, step : step + 1] if baseline_forecast is not None else None
-                anchor_step = anchor_weights[step : step + 1] if anchor_weights is not None else None
-                guidance = ForecastGuidance(
-                    forecaster=short_forecaster,
-                    target=target_batched,
-                    mask=mask_batched,
-                    adjacency=bundle.adjacency.to(device),
-                    config=guidance_config,
-                    lower_bounds=args.lower_bound,
-                    upper_bounds=args.upper_bound,
-                    baseline=baseline_step,
-                    anchor_weights=anchor_step,
-                    node_weights=node_weights,
-                    model_type=short_model_type,
-                )
-
-                fixed_values = current_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
-                warm_start = fixed_values if args.warm_start else None
-                samples = generator.generate(
-                    sample_shape=sample_shape,
-                    guidance=guidance,
-                    num_samples=args.samples,
-                    max_steps=args.max_steps,
-                    warm_start=warm_start,
-                    edit_mask=mask_batched,
-                    fixed_values=fixed_values,
-                )
-
-                with torch.no_grad():
-                    cf_input = prepare_forecaster_input(samples)
-                    cf_preds = forecaster_module.forward_pass(short_forecaster, cf_input, short_model_type)
-                    if cf_preds.dim() == 2:
-                        cf_preds = cf_preds.unsqueeze(-1)
-                    cf_preds = cf_preds[:, :, :1]
-                    diff_sq = (cf_preds - target_batched) ** 2
-                    per_node = diff_sq.mean(dim=2)
-                    mse = (per_node * node_w.view(1, -1)).sum(dim=1)
-
-                best_idx = int(torch.argmin(mse).item())
-                best_indices.append(best_idx)
-                best_pred = cf_preds[best_idx]
-                iterative_predictions[:, step] = best_pred.squeeze(-1)
-                mse_per_step.append(float(mse[best_idx].item()))
-
-                best_window = samples[best_idx]
-                best_windows.append(best_window.detach().cpu())
-
-                next_step = best_window[-1].clone()
-                if 0 <= target_ch < next_step.shape[-1]:
-                    next_step[:, target_ch] = best_pred.squeeze(-1)
-                current_window = torch.cat([best_window[1:], next_step.unsqueeze(0)], dim=0)
+            next_step = best_window[-1].clone()
+            if 0 <= target_ch < next_step.shape[-1]:
+                next_step[:, target_ch] = best_pred.squeeze(-1)
+            current_window = torch.cat([best_window[1:], next_step.unsqueeze(0)], dim=0)
 
         iterative_predictions_cpu = iterative_predictions.detach().cpu()
+        iterative_targets_cpu = iterative_targets.detach().cpu()
         final_window = current_window.detach().cpu()
         baseline_slice = baseline_forecast[:, :iter_steps]
         adjusted_slice = adjusted_target[:, :iter_steps]
@@ -1657,10 +1774,31 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 ncols=5,
             )
 
+        metrics_path: Optional[Path] = None
+        metrics_plot_path: Optional[Path] = None
+        metrics_input = select_metrics_input(
+            args.metrics_input,
+            baseline_slice,
+            guidance_slice,
+            adjusted_slice,
+            default_slice,
+            iterative_actions,
+        )
+        if metrics_input is not None:
+            output_base = Path(args.output_path)
+            metrics_path = Path(args.metrics_path) if args.metrics_path else output_base.with_name(f"{output_base.stem}_metrics.csv")
+            metrics_plot_path = (
+                Path(args.metrics_plot_path) if args.metrics_plot_path else output_base.with_name(f"{output_base.stem}_metrics.png")
+            )
+            metrics = build_counterfactual_metrics(metrics_input, iterative_predictions_cpu, args.metrics_eps)
+            save_counterfactual_metrics_csv(metrics_path, metrics)
+            if metrics_plot_path is not None:
+                save_counterfactual_metrics_plot(metrics_plot_path, metrics)
+
         output = {
             "mode": "iterative",
             "samples": None,
-            "target": guidance_target[:, :iter_steps].unsqueeze(0).cpu(),
+            "target": iterative_targets_cpu.unsqueeze(0),
             "mask": edit_mask.unsqueeze(0).cpu(),
             "guidance": asdict(guidance_config),
             "metadata": {
@@ -1693,21 +1831,24 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             "plot_path": str(plot_path),
             "top_cf_window_plot_path": str(top_window_plot_path) if top_window_plot_path else None,
             "top_cf_window_plot_paths": [str(path) for path in top_window_plot_paths] if top_window_plot_paths else None,
+            "metrics_path": str(metrics_path) if metrics_path else None,
+            "metrics_plot_path": str(metrics_plot_path) if metrics_plot_path else None,
+            "metrics_input": args.metrics_input,
+            "metrics_eps": args.metrics_eps,
             "counterfactual_mse": None,
             "best_sample_index": None,
             "best_counterfactual_prediction": iterative_predictions_cpu,
             "best_counterfactual_window": final_window,
             "cf_horizon": cf_horizon,
             "iterative_steps": iter_steps,
-            "iterative_future_only": args.iterative_future_only,
             "anchor_weights": anchor_weights,
             "anchor_release_power": args.anchor_release_power,
             "guidance_target": guidance_slice,
             "node_weights": node_weights.cpu() if node_weights is not None else None,
             "iterative": {
                 "predictions": iterative_predictions_cpu,
-                "targets": guidance_slice if guidance_slice is not None else None,
-                "actions": iterative_actions.detach().cpu() if iterative_actions is not None else None,
+                "targets": iterative_targets_cpu,
+                "actions": iterative_actions.detach().cpu(),
                 "mse_per_step": torch.tensor(mse_per_step, dtype=torch.float32),
                 "best_indices": best_indices,
                 "best_windows": torch.stack(best_windows) if best_windows else None,

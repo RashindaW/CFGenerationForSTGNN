@@ -5,3 +5,5 @@ checkpoints/
 *.pt
 *.npy
 *.html
+*.png
+*.csv
