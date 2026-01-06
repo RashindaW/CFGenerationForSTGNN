@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
         default="full",
         help="Compute loss/metrics over the full horizon or only the final step.",
     )
+    parser.add_argument(
+        "--lag_last_weight_percent",
+        type=float,
+        default=None,
+        help="Percent of input weight assigned to the last lag step; remaining weight is spread across earlier steps.",
+    )
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--output", type=str, default=None, help="Optional path to save trained weights.")
@@ -268,11 +274,32 @@ def prepare_batch(batch: Tuple[torch.Tensor, torch.Tensor], device: torch.device
     return x, target
 
 
+def build_lag_weights(lag: int, last_weight_percent: Optional[float]) -> Optional[torch.Tensor]:
+    if last_weight_percent is None:
+        return None
+    percent = float(last_weight_percent)
+    if percent < 0.0 or percent > 100.0:
+        raise ValueError("lag_last_weight_percent must be between 0 and 100.")
+    if lag <= 1:
+        return torch.ones(1, dtype=torch.float32)
+    last_share = percent / 100.0
+    other_share = (1.0 - last_share) / (lag - 1)
+    weights = torch.full((lag,), other_share, dtype=torch.float32)
+    weights[-1] = last_share
+    return weights
+
+
 def forward_pass(
     model: torch.nn.Module,
     x: torch.Tensor,
     model_type: str,
+    lag_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if lag_weights is not None:
+        if lag_weights.numel() != x.size(-1):
+            raise ValueError("lag_weights length does not match the input lag dimension.")
+        weights = lag_weights.to(device=x.device, dtype=x.dtype).view(1, 1, 1, -1)
+        x = x * weights
     if model_type == "graphwavenet":
         pad_len = max(0, getattr(model, "receptive_field", 1) - x.size(-1))
         padded_x = nn.functional.pad(x, (pad_len, 0, 0, 0))
@@ -309,6 +336,7 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     grad_clip: float | None = None,
     distributed: bool = False,
+    lag_weights: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
@@ -324,7 +352,7 @@ def run_epoch(
         if is_train:
             optimizer.zero_grad()
         with torch.set_grad_enabled(is_train):
-            prediction = forward_pass(model, x, model_type)
+            prediction = forward_pass(model, x, model_type, lag_weights=lag_weights)
             if loss_focus == "last":
                 prediction = prediction[..., -1:]
                 target = target[..., -1:]
@@ -489,7 +517,19 @@ def test_pipeline(args: argparse.Namespace) -> None:
     criterion = nn.L1Loss()
     pbar = tqdm.tqdm(total=1, desc="Testing Progress")
     loss_focus = checkpoint_args.get("loss_focus", "full") if checkpoint_args else "full"
-    test_stats = run_epoch(model, loaders["test"], device, model_type, criterion, loss_focus=loss_focus)
+    lag_last_weight_percent = (
+        checkpoint_args.get("lag_last_weight_percent", args.lag_last_weight_percent) if checkpoint_args else args.lag_last_weight_percent
+    )
+    lag_weights = build_lag_weights(lag, lag_last_weight_percent)
+    test_stats = run_epoch(
+        model,
+        loaders["test"],
+        device,
+        model_type,
+        criterion,
+        loss_focus=loss_focus,
+        lag_weights=lag_weights,
+    )
     pbar.update(1)
     pbar.close()
     print(
@@ -536,6 +576,7 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
 
     criterion = nn.L1Loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    lag_weights = build_lag_weights(args.lag, args.lag_last_weight_percent)
 
     run_dir = Path(getattr(args, "resolved_run_dir"))
     checkpoint_path = Path(getattr(args, "resolved_checkpoint_path"))
@@ -560,6 +601,7 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             optimizer=optimizer,
             grad_clip=args.grad_clip,
             distributed=distributed,
+            lag_weights=lag_weights,
         )
         val_stats = run_epoch(
             model,
@@ -569,6 +611,7 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             criterion,
             loss_focus=args.loss_focus,
             distributed=distributed,
+            lag_weights=lag_weights,
         )
 
         if rank == 0:

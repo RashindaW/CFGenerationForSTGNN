@@ -77,6 +77,7 @@ class ForecastGuidance:
         anchor_weights: Optional[torch.Tensor] = None,
         node_weights: Optional[torch.Tensor] = None,
         model_type: str = "stgcn",
+        lag_weights: Optional[torch.Tensor] = None,
     ) -> None:
         device = next(forecaster.parameters()).device
         self.forecaster = forecaster
@@ -89,6 +90,7 @@ class ForecastGuidance:
         self.upper_bounds = upper_bounds
         self.baseline = baseline.to(device).float().unsqueeze(0) if baseline is not None else None
         self.model_type = model_type
+        self.lag_weights = lag_weights
         if anchor_weights is not None:
             weights = anchor_weights.to(device).float().view(1, 1, -1)
         else:
@@ -125,7 +127,12 @@ class ForecastGuidance:
             x = x.detach()
             x.requires_grad_(True)
             forecaster_input = prepare_forecaster_input(x)
-            prediction = forward_pass(self.forecaster, forecaster_input, self.model_type)
+            prediction = forward_pass(
+                self.forecaster,
+                forecaster_input,
+                self.model_type,
+                lag_weights=self.lag_weights,
+            )
             base_error = (prediction - self.target).pow(2)
             if self.node_weights is not None:
                 node_w = self.node_weights.view(1, -1, 1)  # (1, N, 1)

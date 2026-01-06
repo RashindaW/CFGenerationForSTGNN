@@ -74,6 +74,12 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
         default="full",
         help="Compute loss/metrics over the full horizon or only the final step.",
     )
+    parser.add_argument(
+        "--lag_last_weight_percent",
+        type=float,
+        default=None,
+        help="Percent of input weight assigned to the last lag step; remaining weight is spread across earlier steps.",
+    )
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--output", type=str, default=None)
@@ -1451,6 +1457,7 @@ def load_forecaster_from_checkpoint(path: Path, device: torch.device, data_root_
     train_ratio = checkpoint_args.get("train_ratio", 0.7)
     val_ratio = checkpoint_args.get("val_ratio", 0.1)
     target_channel = checkpoint_args.get("target_channel", 0)
+    lag_last_weight_percent = checkpoint_args.get("lag_last_weight_percent", None)
     data_root_value = data_root_override or checkpoint_args.get("data_root")
     data_root = Path(data_root_value) if data_root_value else None
 
@@ -1469,12 +1476,15 @@ def load_forecaster_from_checkpoint(path: Path, device: torch.device, data_root_
     state_key = "model_state" if "model_state" in checkpoint else "model"
     model.load_state_dict(checkpoint[state_key])
     model.eval()
+    lag_weights = forecaster_module.build_lag_weights(lag, lag_last_weight_percent)
     metadata = {
         "lag": lag,
         "horizon": horizon,
         "dataset": dataset_name,
         "target_channel": target_channel,
         "model": model_type,
+        "lag_last_weight_percent": lag_last_weight_percent,
+        "lag_weights": lag_weights,
     }
     return model, bundle, metadata
 
@@ -1513,7 +1523,12 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
     forecaster_input = prepare_forecaster_input(past_window_batch)
     with torch.no_grad():
         baseline_forecast = (
-            forecaster_module.forward_pass(forecaster, forecaster_input, model_type)
+            forecaster_module.forward_pass(
+                forecaster,
+                forecaster_input,
+                model_type,
+                lag_weights=dataset_meta.get("lag_weights"),
+            )
             .squeeze(0)
             .detach()
             .cpu()
@@ -1652,7 +1667,12 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         for step in range(iter_steps):
             with torch.no_grad():
                 step_input = prepare_forecaster_input(current_window.unsqueeze(0))
-                step_pred = forecaster_module.forward_pass(short_forecaster, step_input, short_model_type)
+                step_pred = forecaster_module.forward_pass(
+                    short_forecaster,
+                    step_input,
+                    short_model_type,
+                    lag_weights=short_meta.get("lag_weights"),
+                )
                 if step_pred.dim() == 2:
                     step_pred = step_pred.unsqueeze(-1)
                 step_pred = step_pred[:, :, :1]
@@ -1683,6 +1703,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 anchor_weights=anchor_step,
                 node_weights=node_weights,
                 model_type=short_model_type,
+                lag_weights=short_meta.get("lag_weights"),
             )
 
             fixed_values = current_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
@@ -1699,7 +1720,12 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
 
             with torch.no_grad():
                 cf_input = prepare_forecaster_input(samples)
-                cf_preds = forecaster_module.forward_pass(short_forecaster, cf_input, short_model_type)
+                cf_preds = forecaster_module.forward_pass(
+                    short_forecaster,
+                    cf_input,
+                    short_model_type,
+                    lag_weights=short_meta.get("lag_weights"),
+                )
                 if cf_preds.dim() == 2:
                     cf_preds = cf_preds.unsqueeze(-1)
                 cf_preds = cf_preds[:, :, :1]
@@ -1876,6 +1902,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         anchor_weights=anchor_weights,
         node_weights=node_weights,
         model_type=model_type,
+        lag_weights=dataset_meta.get("lag_weights"),
     )
 
     warm_start = None
@@ -1892,7 +1919,12 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
 
     with torch.no_grad():
         cf_input = prepare_forecaster_input(samples)
-        cf_preds = forecaster_module.forward_pass(forecaster, cf_input, model_type)
+        cf_preds = forecaster_module.forward_pass(
+            forecaster,
+            cf_input,
+            model_type,
+            lag_weights=dataset_meta.get("lag_weights"),
+        )
         cf_preds = cf_preds[:, :, :cf_horizon]
         node_w = node_weights.to(device) if node_weights is not None else torch.ones(bundle.num_nodes, device=device)
         node_w = node_w / node_w.sum().clamp(min=1e-8)
