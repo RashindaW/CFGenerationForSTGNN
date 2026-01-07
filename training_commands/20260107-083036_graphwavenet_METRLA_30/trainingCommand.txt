@@ -1,0 +1,1 @@
+/home/rashinda/.conda/envs/rashindaNew-torch-env/bin/python main.py forecaster --model graphwavenet --dataset METRLA_30 --data_root /mnt/datassd3/rashinda/CFGenerationForSGNN/CFGenerationForSGNN/preprocessing/data --lag 12 --horizon 1 --loss_focus last --batch_size 64 --epochs 1500 --lag_last_weight_percent 90 --learning_rate 1e-5 --neighbor_only_inputs --patience 0

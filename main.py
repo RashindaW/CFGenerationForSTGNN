@@ -80,6 +80,11 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
         default=None,
         help="Percent of input weight assigned to the last lag step; remaining weight is spread across earlier steps.",
     )
+    parser.add_argument(
+        "--neighbor_only_inputs",
+        action="store_true",
+        help="Use only neighbor history by pre-aggregating inputs with an adjacency matrix that excludes self loops.",
+    )
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--output", type=str, default=None)
@@ -174,7 +179,7 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
     parser.add_argument("--sample_index", type=int, default=0)
     parser.add_argument("--mask_path", type=str, default=None, help="Optional path to a numpy mask of shape (T, N, F).")
     parser.add_argument("--target_path", type=str, default=None, help="Optional path to a numpy target (H, N).")
-    parser.add_argument("--samples", type=int, default=10)
+    parser.add_argument("--samples", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument(
         "--iterative_guidance",
@@ -1458,6 +1463,7 @@ def load_forecaster_from_checkpoint(path: Path, device: torch.device, data_root_
     val_ratio = checkpoint_args.get("val_ratio", 0.1)
     target_channel = checkpoint_args.get("target_channel", 0)
     lag_last_weight_percent = checkpoint_args.get("lag_last_weight_percent", None)
+    neighbor_only_inputs = checkpoint_args.get("neighbor_only_inputs", False)
     data_root_value = data_root_override or checkpoint_args.get("data_root")
     data_root = Path(data_root_value) if data_root_value else None
 
@@ -1485,6 +1491,7 @@ def load_forecaster_from_checkpoint(path: Path, device: torch.device, data_root_
         "model": model_type,
         "lag_last_weight_percent": lag_last_weight_percent,
         "lag_weights": lag_weights,
+        "neighbor_only_inputs": neighbor_only_inputs,
     }
     return model, bundle, metadata
 
@@ -1528,6 +1535,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 forecaster_input,
                 model_type,
                 lag_weights=dataset_meta.get("lag_weights"),
+                adjacency=bundle.adjacency,
+                neighbor_only_inputs=dataset_meta.get("neighbor_only_inputs", False),
             )
             .squeeze(0)
             .detach()
@@ -1672,6 +1681,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                     step_input,
                     short_model_type,
                     lag_weights=short_meta.get("lag_weights"),
+                    adjacency=short_bundle.adjacency,
+                    neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
                 )
                 if step_pred.dim() == 2:
                     step_pred = step_pred.unsqueeze(-1)
@@ -1702,6 +1713,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 baseline=baseline_step,
                 anchor_weights=anchor_step,
                 node_weights=node_weights,
+                neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
                 model_type=short_model_type,
                 lag_weights=short_meta.get("lag_weights"),
             )
@@ -1725,6 +1737,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                     cf_input,
                     short_model_type,
                     lag_weights=short_meta.get("lag_weights"),
+                    adjacency=short_bundle.adjacency,
+                    neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
                 )
                 if cf_preds.dim() == 2:
                     cf_preds = cf_preds.unsqueeze(-1)
@@ -1901,6 +1915,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         baseline=baseline_forecast,
         anchor_weights=anchor_weights,
         node_weights=node_weights,
+        neighbor_only_inputs=dataset_meta.get("neighbor_only_inputs", False),
         model_type=model_type,
         lag_weights=dataset_meta.get("lag_weights"),
     )
@@ -1924,6 +1939,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             cf_input,
             model_type,
             lag_weights=dataset_meta.get("lag_weights"),
+            adjacency=bundle.adjacency,
+            neighbor_only_inputs=dataset_meta.get("neighbor_only_inputs", False),
         )
         cf_preds = cf_preds[:, :, :cf_horizon]
         node_w = node_weights.to(device) if node_weights is not None else torch.ones(bundle.num_nodes, device=device)

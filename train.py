@@ -65,6 +65,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Percent of input weight assigned to the last lag step; remaining weight is spread across earlier steps.",
     )
+    parser.add_argument(
+        "--neighbor_only_inputs",
+        action="store_true",
+        help="Use only neighbor history by pre-aggregating inputs with an adjacency matrix that excludes self loops.",
+    )
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--output", type=str, default=None, help="Optional path to save trained weights.")
@@ -294,12 +299,16 @@ def forward_pass(
     x: torch.Tensor,
     model_type: str,
     lag_weights: Optional[torch.Tensor] = None,
+    adjacency: Optional[torch.Tensor] = None,
+    neighbor_only_inputs: bool = False,
 ) -> torch.Tensor:
     if lag_weights is not None:
         if lag_weights.numel() != x.size(-1):
             raise ValueError("lag_weights length does not match the input lag dimension.")
         weights = lag_weights.to(device=x.device, dtype=x.dtype).view(1, 1, 1, -1)
         x = x * weights
+    if neighbor_only_inputs:
+        x = _neighbor_only_inputs(x, adjacency)
     if model_type == "graphwavenet":
         pad_len = max(0, getattr(model, "receptive_field", 1) - x.size(-1))
         padded_x = nn.functional.pad(x, (pad_len, 0, 0, 0))
@@ -320,6 +329,33 @@ def forward_pass(
     return output
 
 
+def _neighbor_only_inputs(x: torch.Tensor, adjacency: Optional[torch.Tensor]) -> torch.Tensor:
+    if adjacency is None:
+        raise ValueError("adjacency must be provided when neighbor_only_inputs is enabled.")
+    adj = adjacency.to(device=x.device, dtype=x.dtype)
+    if adj.dim() == 3 and adj.size(0) == 1:
+        adj = adj[0]
+    if adj.dim() == 2:
+        adj = adj.clone()
+        adj.fill_diagonal_(0)
+        denom = adj.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        adj = adj / denom
+        x_perm = x.permute(0, 1, 3, 2)
+        x_agg = torch.matmul(x_perm, adj.T)
+        return x_agg.permute(0, 1, 3, 2)
+    if adj.dim() == 3:
+        adj = adj.clone()
+        adj.diagonal(dim1=-2, dim2=-1).zero_()
+        denom = adj.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        adj = adj / denom
+        x_perm = x.permute(0, 1, 3, 2)
+        x_flat = x_perm.reshape(x_perm.size(0), -1, x_perm.size(-1))
+        x_agg = torch.bmm(x_flat, adj.transpose(1, 2))
+        x_agg = x_agg.reshape(x_perm.shape)
+        return x_agg.permute(0, 1, 3, 2)
+    raise ValueError("adjacency must have shape (N, N) or (B, N, N)")
+
+
 def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> Tuple[float, float]:
     mae = torch.mean(torch.abs(pred - target)).item()
     rmse = torch.sqrt(torch.mean((pred - target) ** 2)).item()
@@ -337,6 +373,8 @@ def run_epoch(
     grad_clip: float | None = None,
     distributed: bool = False,
     lag_weights: Optional[torch.Tensor] = None,
+    adjacency: Optional[torch.Tensor] = None,
+    neighbor_only_inputs: bool = False,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
@@ -352,7 +390,14 @@ def run_epoch(
         if is_train:
             optimizer.zero_grad()
         with torch.set_grad_enabled(is_train):
-            prediction = forward_pass(model, x, model_type, lag_weights=lag_weights)
+            prediction = forward_pass(
+                model,
+                x,
+                model_type,
+                lag_weights=lag_weights,
+                adjacency=adjacency,
+                neighbor_only_inputs=neighbor_only_inputs,
+            )
             if loss_focus == "last":
                 prediction = prediction[..., -1:]
                 target = target[..., -1:]
@@ -521,6 +566,7 @@ def test_pipeline(args: argparse.Namespace) -> None:
         checkpoint_args.get("lag_last_weight_percent", args.lag_last_weight_percent) if checkpoint_args else args.lag_last_weight_percent
     )
     lag_weights = build_lag_weights(lag, lag_last_weight_percent)
+    neighbor_only_inputs = checkpoint_args.get("neighbor_only_inputs", False) if checkpoint_args else False
     test_stats = run_epoch(
         model,
         loaders["test"],
@@ -529,6 +575,8 @@ def test_pipeline(args: argparse.Namespace) -> None:
         criterion,
         loss_focus=loss_focus,
         lag_weights=lag_weights,
+        adjacency=bundle.adjacency,
+        neighbor_only_inputs=neighbor_only_inputs,
     )
     pbar.update(1)
     pbar.close()
@@ -602,6 +650,8 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             grad_clip=args.grad_clip,
             distributed=distributed,
             lag_weights=lag_weights,
+            adjacency=bundle.adjacency,
+            neighbor_only_inputs=args.neighbor_only_inputs,
         )
         val_stats = run_epoch(
             model,
@@ -612,6 +662,8 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             loss_focus=args.loss_focus,
             distributed=distributed,
             lag_weights=lag_weights,
+            adjacency=bundle.adjacency,
+            neighbor_only_inputs=args.neighbor_only_inputs,
         )
 
         if rank == 0:

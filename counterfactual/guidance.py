@@ -76,6 +76,7 @@ class ForecastGuidance:
         baseline: Optional[torch.Tensor] = None,
         anchor_weights: Optional[torch.Tensor] = None,
         node_weights: Optional[torch.Tensor] = None,
+        neighbor_only_inputs: bool = False,
         model_type: str = "stgcn",
         lag_weights: Optional[torch.Tensor] = None,
     ) -> None:
@@ -89,6 +90,7 @@ class ForecastGuidance:
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds
         self.baseline = baseline.to(device).float().unsqueeze(0) if baseline is not None else None
+        self.neighbor_only_inputs = neighbor_only_inputs
         self.model_type = model_type
         self.lag_weights = lag_weights
         if anchor_weights is not None:
@@ -132,6 +134,8 @@ class ForecastGuidance:
                 forecaster_input,
                 self.model_type,
                 lag_weights=self.lag_weights,
+                adjacency=self.adjacency,
+                neighbor_only_inputs=self.neighbor_only_inputs,
             )
             base_error = (prediction - self.target).pow(2)
             if self.node_weights is not None:
