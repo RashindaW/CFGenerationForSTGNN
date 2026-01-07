@@ -179,7 +179,7 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
     parser.add_argument("--sample_index", type=int, default=0)
     parser.add_argument("--mask_path", type=str, default=None, help="Optional path to a numpy mask of shape (T, N, F).")
     parser.add_argument("--target_path", type=str, default=None, help="Optional path to a numpy target (H, N).")
-    parser.add_argument("--samples", type=int, default=100)
+    parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument(
         "--iterative_guidance",
@@ -290,6 +290,24 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         type=int,
         default=None,
         help="Number of lagged time steps to plot (from most recent backwards). If None, plots all available lag steps.",
+    )
+    parser.add_argument(
+        "--mask_target_history",
+        action="store_true",
+        help="Mask the target node's lag history when using the short-term forecaster during iterative counterfactuals.",
+    )
+    parser.add_argument(
+        "--mask_target_history_mode",
+        type=str,
+        choices=["zeros", "guidance", "alternating", "blend"],
+        default="zeros",
+        help="Strategy for masking the target node history when --mask_target_history is set.",
+    )
+    parser.add_argument(
+        "--mask_target_history_alpha",
+        type=float,
+        default=0.5,
+        help="Guidance weight for --mask_target_history_mode=blend (alpha * guidance + (1-alpha) * forecast).",
     )
     parser.add_argument(
         "--metrics_path",
@@ -648,6 +666,55 @@ def prepare_target(default_target: torch.Tensor, path: Optional[str]) -> torch.T
     if tensor.shape != default_target.shape:
         raise ValueError(f"Target shape {tensor.shape} does not match expected {default_target.shape}")
     return tensor
+
+
+def mask_target_history_input(
+    forecaster_input: torch.Tensor,
+    target_node: int,
+    target_channel: int,
+    mask_value: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if target_node < 0:
+        return forecaster_input
+    if forecaster_input.dim() != 4:
+        raise ValueError("forecaster_input must have shape (batch, channels, nodes, lag)")
+    if target_node >= forecaster_input.size(2):
+        raise ValueError(f"target node {target_node} is out of range for {forecaster_input.size(2)} nodes")
+    masked = forecaster_input.clone()
+    masked[:, :, target_node, :] = 0.0
+    if mask_value is not None and 0 <= target_channel < masked.size(1):
+        fill = torch.as_tensor(mask_value, device=masked.device, dtype=masked.dtype)
+        masked[:, target_channel, target_node, :] = fill
+    return masked
+
+
+def compute_mask_target_value(
+    mode: str,
+    step: int,
+    guidance_target: Optional[torch.Tensor],
+    iterative_predictions: Optional[torch.Tensor],
+    target_node: int,
+    alpha: float,
+) -> Optional[torch.Tensor]:
+    if mode == "zeros":
+        return None
+    if guidance_target is None:
+        raise ValueError("guidance_target is required for non-zero mask_target_history modes.")
+    if target_node < 0 or target_node >= guidance_target.size(0):
+        raise ValueError(f"target node {target_node} is out of range for {guidance_target.size(0)} nodes")
+    guidance_idx = max(step - 1, 0)
+    guidance_val = guidance_target[target_node, guidance_idx]
+    forecast_val = guidance_val
+    if iterative_predictions is not None and step > 0:
+        forecast_val = iterative_predictions[target_node, step - 1]
+    if mode == "guidance":
+        return guidance_val
+    if mode == "alternating":
+        return guidance_val if step % 2 == 1 else forecast_val
+    if mode == "blend":
+        alpha_val = float(alpha)
+        return guidance_val * alpha_val + forecast_val * (1.0 - alpha_val)
+    raise ValueError(f"Unknown mask_target_history_mode {mode}")
 
 
 def adjust_target(
@@ -1236,6 +1303,7 @@ def save_prediction_plot(
     adjusted_target: torch.Tensor,
     ground_truth: torch.Tensor,
     guidance_target: Optional[torch.Tensor] = None,
+    step_target: Optional[torch.Tensor] = None,
     lag_target: Optional[torch.Tensor] = None,
     plot_lag_steps: Optional[int] = None,
 ) -> None:
@@ -1283,6 +1351,15 @@ def save_prediction_plot(
             label="Guidance target",
             linestyle="-.",
             linewidth=2,
+        )
+    if step_target is not None:
+        plt.scatter(
+            steps,
+            step_target[node_index].detach().cpu().numpy(),
+            label="Step target",
+            marker="x",
+            color="black",
+            zorder=3,
         )
     plt.scatter(
         [horizon],
@@ -1666,7 +1743,9 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         iterative_predictions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
         iterative_actions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
         iterative_targets = torch.zeros((bundle.num_nodes, iter_steps), device=device)
-        target_series = default_target.to(device)
+        if guidance_target is None:
+            raise ValueError("guidance_target is required for iterative guidance.")
+        target_series = guidance_target.to(device)
 
         edit_mask = torch.zeros_like(base_mask)
         edit_mask[-1] = 1.0
@@ -1674,8 +1753,20 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         edit_mask = edit_mask.to(device)
 
         for step in range(iter_steps):
+            mask_value = None
+            if args.mask_target_history and args.target_adjust_node >= 0:
+                mask_value = compute_mask_target_value(
+                    args.mask_target_history_mode,
+                    step,
+                    target_series,
+                    iterative_predictions,
+                    args.target_adjust_node,
+                    args.mask_target_history_alpha,
+                )
             with torch.no_grad():
                 step_input = prepare_forecaster_input(current_window.unsqueeze(0))
+                if args.mask_target_history and args.target_adjust_node >= 0:
+                    step_input = mask_target_history_input(step_input, args.target_adjust_node, target_ch, mask_value)
                 step_pred = forecaster_module.forward_pass(
                     short_forecaster,
                     step_input,
@@ -1690,11 +1781,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             step_pred = step_pred.squeeze(0)
             iterative_actions[:, step] = step_pred.squeeze(-1)
 
-            if args.target_adjust_node < 0:
-                step_target = target_series[:, step : step + 1]
-            else:
-                step_target = step_pred.clone()
-                step_target[args.target_adjust_node, 0] = target_series[args.target_adjust_node, step]
+            step_target = target_series[:, step : step + 1]
             iterative_targets[:, step] = step_target.squeeze(-1)
 
             target_batched = step_target.unsqueeze(0).repeat(args.samples, 1, 1)
@@ -1714,6 +1801,9 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 anchor_weights=anchor_step,
                 node_weights=node_weights,
                 neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
+                masked_target_node=args.target_adjust_node if args.mask_target_history else None,
+                masked_target_channel=target_ch if args.mask_target_history else None,
+                masked_target_value=mask_value if args.mask_target_history else None,
                 model_type=short_model_type,
                 lag_weights=short_meta.get("lag_weights"),
             )
@@ -1732,6 +1822,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
 
             with torch.no_grad():
                 cf_input = prepare_forecaster_input(samples)
+                if args.mask_target_history and args.target_adjust_node >= 0:
+                    cf_input = mask_target_history_input(cf_input, args.target_adjust_node, target_ch, mask_value)
                 cf_preds = forecaster_module.forward_pass(
                     short_forecaster,
                     cf_input,
@@ -1774,6 +1866,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         adjusted_target_plot = inverse_target_scale(adjusted_slice, bundle.scaler)
         default_target_plot = inverse_target_scale(default_slice, bundle.scaler)
         guidance_target_plot = inverse_target_scale(guidance_slice, bundle.scaler) if guidance_slice is not None else None
+        iterative_targets_plot = inverse_target_scale(iterative_targets_cpu, bundle.scaler)
 
         plot_node = args.plot_node if args.plot_node is not None else (args.target_adjust_node if args.target_adjust_node >= 0 else 0)
         plot_path = Path(args.plot_path) if args.plot_path else Path(args.output_path).with_name(Path(args.output_path).stem + "_plot.png")
@@ -1791,6 +1884,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 adjusted_target_plot,
                 default_target_plot,
                 guidance_target_plot,
+                step_target=iterative_targets_plot,
                 lag_target=lag_target_plot,
                 plot_lag_steps=args.plot_lag_steps,
             )
@@ -1875,6 +1969,9 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             "metrics_plot_path": str(metrics_plot_path) if metrics_plot_path else None,
             "metrics_input": args.metrics_input,
             "metrics_eps": args.metrics_eps,
+            "mask_target_history": args.mask_target_history,
+            "mask_target_history_mode": args.mask_target_history_mode,
+            "mask_target_history_alpha": args.mask_target_history_alpha,
             "counterfactual_mse": None,
             "best_sample_index": None,
             "best_counterfactual_prediction": iterative_predictions_cpu,
@@ -2030,6 +2127,9 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         "use_predicted_target": args.use_predicted_target,
         "plot_path": str(plot_path),
         "top_cf_window_plot_path": str(top_window_plot_path) if top_window_plot_path else None,
+        "mask_target_history": args.mask_target_history,
+        "mask_target_history_mode": args.mask_target_history_mode,
+        "mask_target_history_alpha": args.mask_target_history_alpha,
         "counterfactual_mse": mse_cpu,
         "best_sample_index": best_idx,
         "best_counterfactual_prediction": best_cf_prediction,
