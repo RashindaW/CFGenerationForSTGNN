@@ -1124,6 +1124,29 @@ def prepare_node_weights(
     )
 
 
+def load_subgraph_nodes_for_target(
+    adjacency: torch.Tensor,
+    target_node: int,
+    subgraph_cache: Path,
+    config: RandomWalkConfig,
+) -> np.ndarray:
+    if target_node < 0:
+        return np.array([], dtype=np.int64)
+    adj_np = adjacency.detach().cpu().numpy()
+    if adj_np.ndim == 3:
+        adj_np = adj_np[0]
+    try:
+        ensure_subgraph_cache(adj_np, subgraph_cache, config)
+    except Exception as exc:  # pragma: no cover - cache writes may be skipped in read-only envs
+        print(f"Warning: could not build subgraph cache at {subgraph_cache}: {exc}")
+    subgraph_path = subgraph_cache / f"node_{target_node}.npy"
+    if subgraph_path.exists():
+        nodes, _ = load_subgraph(subgraph_path)
+    else:
+        nodes, _ = random_walk_subgraph(adj_np, target_node, config)
+    return nodes
+
+
 def truncate_horizon(tensor: torch.Tensor, horizon: Optional[int]) -> torch.Tensor:
     if horizon is None or tensor.shape[1] <= horizon:
         return tensor
@@ -1519,6 +1542,61 @@ def save_iterative_cf_window_plots(
     return saved_paths
 
 
+def save_control_node_action_plots(
+    output_dir: Path,
+    target_node: int,
+    control_nodes: List[int],
+    prev_last_lag: torch.Tensor,
+    edited_last_lag: torch.Tensor,
+) -> List[Path]:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib is not available; skipping control-node action plots.")
+        return []
+
+    if prev_last_lag.shape != edited_last_lag.shape:
+        raise ValueError("prev_last_lag and edited_last_lag must have the same shape")
+    if prev_last_lag.dim() != 2:
+        raise ValueError("prev_last_lag and edited_last_lag must be shaped (nodes, steps)")
+
+    steps = np.arange(1, prev_last_lag.shape[1] + 1)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    saved: List[Path] = []
+
+    for node in control_nodes:
+        if node == target_node or node < 0 or node >= prev_last_lag.shape[0]:
+            continue
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(
+            steps,
+            prev_last_lag[node].detach().cpu().numpy(),
+            label="Previous last lag",
+            color="tab:blue",
+            linewidth=2,
+        )
+        ax.plot(
+            steps,
+            edited_last_lag[node].detach().cpu().numpy(),
+            label="Edited last lag",
+            color="tab:orange",
+            linewidth=2,
+        )
+        ax.set_title(f"Node {node} last-lag edits")
+        ax.set_xlabel("Iterative step")
+        ax.set_ylabel("Value")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        save_path = output_dir / f"target_{target_node}_node_{node}.png"
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=200)
+        plt.close(fig)
+        saved.append(save_path)
+    if saved:
+        print(f"Saved control-node action plots to {output_dir}")
+    return saved
+
+
 def select_split_dataset(bundle: TemporalDatasetBundle, split: str):
     if split == "train":
         return bundle.train
@@ -1742,6 +1820,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         best_indices: list[int] = []
         iterative_predictions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
         iterative_actions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
+        iterative_prev_last_lag = torch.zeros((bundle.num_nodes, iter_steps), device=device)
+        iterative_edited_last_lag = torch.zeros((bundle.num_nodes, iter_steps), device=device)
         iterative_targets = torch.zeros((bundle.num_nodes, iter_steps), device=device)
         if guidance_target is None:
             raise ValueError("guidance_target is required for iterative guidance.")
@@ -1753,6 +1833,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         edit_mask = edit_mask.to(device)
 
         for step in range(iter_steps):
+            if 0 <= target_ch < current_window.shape[-1]:
+                iterative_prev_last_lag[:, step] = current_window[-1, :, target_ch]
             mask_value = None
             if args.mask_target_history and args.target_adjust_node >= 0:
                 mask_value = compute_mask_target_value(
@@ -1846,6 +1928,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             mse_per_step.append(float(mse[best_idx].item()))
 
             best_window = samples[best_idx]
+            if 0 <= target_ch < best_window.shape[-1]:
+                iterative_edited_last_lag[:, step] = best_window[-1, :, target_ch]
             best_windows.append(best_window.detach().cpu())
 
             next_step = best_window[-1].clone()
@@ -1854,6 +1938,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             current_window = torch.cat([best_window[1:], next_step.unsqueeze(0)], dim=0)
 
         iterative_predictions_cpu = iterative_predictions.detach().cpu()
+        iterative_prev_last_lag_cpu = iterative_prev_last_lag.detach().cpu()
+        iterative_edited_last_lag_cpu = iterative_edited_last_lag.detach().cpu()
         iterative_targets_cpu = iterative_targets.detach().cpu()
         final_window = current_window.detach().cpu()
         baseline_slice = baseline_forecast[:, :iter_steps]
@@ -1867,6 +1953,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         default_target_plot = inverse_target_scale(default_slice, bundle.scaler)
         guidance_target_plot = inverse_target_scale(guidance_slice, bundle.scaler) if guidance_slice is not None else None
         iterative_targets_plot = inverse_target_scale(iterative_targets_cpu, bundle.scaler)
+        prev_last_lag_plot = inverse_target_scale(iterative_prev_last_lag_cpu, bundle.scaler)
+        edited_last_lag_plot = inverse_target_scale(iterative_edited_last_lag_cpu, bundle.scaler)
 
         plot_node = args.plot_node if args.plot_node is not None else (args.target_adjust_node if args.target_adjust_node >= 0 else 0)
         plot_path = Path(args.plot_path) if args.plot_path else Path(args.output_path).with_name(Path(args.output_path).stem + "_plot.png")
@@ -1907,6 +1995,32 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 per_page=10,
                 ncols=5,
             )
+
+        control_action_dir = Path(args.output_path).with_name("control_node_actions")
+        control_action_paths: Optional[List[Path]] = None
+        if args.target_adjust_node >= 0 and iter_steps > 0:
+            rw_config = RandomWalkConfig(
+                num_walks=args.subgraph_num_walks,
+                walk_length=args.subgraph_walk_length,
+                restart_prob=args.subgraph_restart_prob,
+                top_k=args.subgraph_top_k,
+                seed=args.subgraph_seed,
+            )
+            control_nodes = load_subgraph_nodes_for_target(
+                bundle.adjacency,
+                args.target_adjust_node,
+                subgraph_cache_dir,
+                rw_config,
+            )
+            control_nodes_list = [int(node) for node in control_nodes.tolist()]
+            if control_nodes_list:
+                control_action_paths = save_control_node_action_plots(
+                    control_action_dir,
+                    args.target_adjust_node,
+                    control_nodes_list,
+                    prev_last_lag_plot,
+                    edited_last_lag_plot,
+                )
 
         metrics_path: Optional[Path] = None
         metrics_plot_path: Optional[Path] = None
@@ -1967,6 +2081,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             "top_cf_window_plot_paths": [str(path) for path in top_window_plot_paths] if top_window_plot_paths else None,
             "metrics_path": str(metrics_path) if metrics_path else None,
             "metrics_plot_path": str(metrics_plot_path) if metrics_plot_path else None,
+            "control_node_action_dir": str(control_action_dir) if control_action_paths else None,
+            "control_node_action_paths": [str(path) for path in control_action_paths] if control_action_paths else None,
             "metrics_input": args.metrics_input,
             "metrics_eps": args.metrics_eps,
             "mask_target_history": args.mask_target_history,
@@ -1986,6 +2102,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 "predictions": iterative_predictions_cpu,
                 "targets": iterative_targets_cpu,
                 "actions": iterative_actions.detach().cpu(),
+                "prev_last_lag": iterative_prev_last_lag_cpu,
+                "edited_last_lag": iterative_edited_last_lag_cpu,
                 "mse_per_step": torch.tensor(mse_per_step, dtype=torch.float32),
                 "best_indices": best_indices,
                 "best_windows": torch.stack(best_windows) if best_windows else None,
