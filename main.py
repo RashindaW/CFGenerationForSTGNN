@@ -35,6 +35,7 @@ from counterfactual.subgraph import (
     random_walk_subgraph,
     save_subgraphs,
 )
+from models.causal_forecaster import load_feature_names
 from preprocessing.data_reader import TemporalDatasetBundle, load_dataset
 from preprocessing.graphwavenet_utils import StandardScaler
 from train import build_dataloaders, train_pipeline, test_pipeline
@@ -42,11 +43,16 @@ from train import build_dataloaders, train_pipeline, test_pipeline
 
 def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> argparse.ArgumentParser:
     parser = subparsers.add_parser("forecaster", help="Train or evaluate an ST-GNN forecaster.")
-    parser.add_argument("--model", type=str, choices=["stgcn", "graphwavenet", "mstgcn", "astgcn"], default="stgcn")
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["stgcn", "graphwavenet", "mstgcn", "astgcn", "causal_forecaster"],
+        default="stgcn",
+    )
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
+        choices=["METRLA", "PEMSBAY", "TEP", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
         default="METRLA",
     )
     parser.add_argument("--data_root", type=str, default=None)
@@ -61,6 +67,43 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--temporal_kernel", type=int, default=3)
     parser.add_argument("--cheb_k", type=int, default=3)
+    parser.add_argument(
+        "--temporal_encoder",
+        type=str,
+        choices=["lstm", "tcn", "transformer"],
+        default="lstm",
+        help="Temporal encoder for causal_forecaster.",
+    )
+    parser.add_argument("--temporal_layers", type=int, default=1, help="Temporal encoder layers for causal_forecaster.")
+    parser.add_argument("--attention_heads", type=int, default=4, help="Attention heads for causal_forecaster.")
+    parser.add_argument("--decoder_layers", type=int, default=2, help="Decoder MLP layers for causal_forecaster.")
+    parser.add_argument("--fusion_rounds", type=int, default=1, help="Causal fusion rounds for causal_forecaster.")
+    parser.add_argument(
+        "--spatial_norm",
+        type=str,
+        choices=["sym", "row"],
+        default="sym",
+        help="Adjacency normalization for causal_forecaster spatial GNN.",
+    )
+    parser.add_argument(
+        "--control_nodes",
+        type=str,
+        default=None,
+        help="Comma-separated global node indices used as control nodes.",
+    )
+    parser.add_argument(
+        "--manip_nodes",
+        type=str,
+        default=None,
+        help="Comma-separated global node indices used as manipulated nodes.",
+    )
+    parser.add_argument(
+        "--target_nodes",
+        type=str,
+        default=None,
+        help="Comma-separated global node indices used as target nodes (subset of manipulated).",
+    )
+    parser.add_argument("--tcn_dilation_base", type=int, default=2, help="TCN dilation base for causal_forecaster.")
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--device", type=str, default=None)
@@ -108,7 +151,7 @@ def add_diffusion_subcommand(subparsers: argparse._SubParsersAction[argparse.Arg
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
+        choices=["METRLA", "PEMSBAY", "TEP", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
         default="METRLA",
     )
     parser.add_argument("--data_root", type=str, default=None)
@@ -149,7 +192,7 @@ def add_subgraph_subcommand(subparsers: argparse._SubParsersAction[argparse.Argu
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
+        choices=["METRLA", "PEMSBAY", "TEP", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
         default="METRLA",
     )
     parser.add_argument("--data_root", type=str, default=None, help="Root directory containing dataset folders.")
@@ -1070,6 +1113,22 @@ def default_subgraph_dir(dataset: str, data_root: Optional[str | Path]) -> Path:
     return resolve_dataset_dir(dataset, data_root) / "subgraphs_random_walk"
 
 
+def resolve_tep_control_nodes(dataset: str, data_root: Optional[str | Path], num_nodes: int) -> np.ndarray:
+    if dataset.upper() != "TEP":
+        return np.array([], dtype=np.int64)
+    dataset_dir = resolve_dataset_dir(dataset, data_root)
+    feature_names = load_feature_names(dataset_dir)
+    control_nodes: List[int] = []
+    if feature_names:
+        control_nodes = [idx for idx, name in enumerate(feature_names) if name.lower().startswith("xmv_")]
+    if not control_nodes:
+        start = max(num_nodes - 11, 0)
+        control_nodes = list(range(start, num_nodes))
+        if control_nodes:
+            print("Warning: TEP control node names not found; defaulting to the last 11 nodes.")
+    return np.array(control_nodes, dtype=np.int64)
+
+
 def prepare_node_weights(
     adjacency: torch.Tensor,
     target_node: int,
@@ -1092,6 +1151,24 @@ def prepare_node_weights(
 
     if strategy == "hop":
         return compute_hop_node_weights(adjacency, target_node, focus_percent)
+
+    if strategy == "subgraph" and dataset.upper() == "TEP":
+        control_nodes = resolve_tep_control_nodes(dataset, data_root, num_nodes)
+        if target_node >= 0:
+            control_nodes = control_nodes[control_nodes != target_node]
+        if control_nodes.size == 0:
+            weights = torch.ones(num_nodes, dtype=torch.float32)
+            return weights / weights.sum().clamp(min=1e-8)
+        spillover_fraction = max(0.0, subgraph_args.subgraph_spillover_percent / 100.0)
+        subgraph_weights = np.ones(control_nodes.size, dtype=np.float32)
+        return build_node_weight_vector(
+            num_nodes=num_nodes,
+            target_node=target_node,
+            target_share=focus_percent / 100.0,
+            subgraph_nodes=control_nodes,
+            subgraph_weights=subgraph_weights,
+            spillover_fraction=spillover_fraction,
+        )
 
     subgraph_cache = Path(subgraph_args.subgraph_dir) if subgraph_args.subgraph_dir else default_subgraph_dir(dataset, data_root)
     rw_config = RandomWalkConfig(
@@ -1129,12 +1206,19 @@ def load_subgraph_nodes_for_target(
     target_node: int,
     subgraph_cache: Path,
     config: RandomWalkConfig,
+    dataset: str,
+    data_root: Optional[str | Path],
 ) -> np.ndarray:
     if target_node < 0:
         return np.array([], dtype=np.int64)
     adj_np = adjacency.detach().cpu().numpy()
     if adj_np.ndim == 3:
         adj_np = adj_np[0]
+    if dataset.upper() == "TEP":
+        control_nodes = resolve_tep_control_nodes(dataset, data_root, adj_np.shape[0])
+        if target_node >= 0:
+            control_nodes = control_nodes[control_nodes != target_node]
+        return control_nodes
     try:
         ensure_subgraph_cache(adj_np, subgraph_cache, config)
     except Exception as exc:  # pragma: no cover - cache writes may be skipped in read-only envs
@@ -2011,6 +2095,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 args.target_adjust_node,
                 subgraph_cache_dir,
                 rw_config,
+                dataset_meta["dataset"],
+                args.data_root,
             )
             control_nodes_list = [int(node) for node in control_nodes.tolist()]
             if control_nodes_list:

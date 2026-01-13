@@ -134,6 +134,9 @@ class ForecastGuidance:
         with torch.enable_grad():
             x = x.detach()
             x.requires_grad_(True)
+            # Temporarily enable training mode for cudnn RNN backward compatibility
+            was_training = self.forecaster.training
+            self.forecaster.train()
             forecaster_input = prepare_forecaster_input(x)
             if self.masked_target_node is not None and self.masked_target_node >= 0:
                 if self.masked_target_node >= forecaster_input.size(2):
@@ -187,6 +190,9 @@ class ForecastGuidance:
                 loss = loss + self.config.control_energy_weight * control_energy(x, self.mask)
 
             grad = torch.autograd.grad(loss, x)[0]
+            # Restore original training mode
+            if not was_training:
+                self.forecaster.eval()
             if self.config.max_grad_norm is not None:
                 grad_norm = grad.norm().clamp(min=1e-8)
                 max_norm = torch.tensor(self.config.max_grad_norm, device=grad.device, dtype=grad.dtype)

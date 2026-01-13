@@ -9,7 +9,7 @@ import shlex
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -18,6 +18,13 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from models.causal_forecaster import (
+    CausalDualStreamForecaster,
+    CausalForecasterConfig,
+    infer_node_groups,
+    load_feature_names,
+    parse_index_list,
+)
 from models.graphwavenet import GraphWaveNet
 from models.stgcn import STGCN, STGCNConfig
 from models.mstgcn import MSTGCN, MSTGCNConfig
@@ -27,11 +34,16 @@ from preprocessing.data_reader import TemporalDatasetBundle, load_dataset
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train spatio-temporal models on traffic datasets.")
-    parser.add_argument("--model", type=str, choices=["stgcn", "graphwavenet","mstgcn", "astgcn"], default="stgcn")
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["stgcn", "graphwavenet", "mstgcn", "astgcn", "causal_forecaster"],
+        default="stgcn",
+    )
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["METRLA", "PEMSBAY", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
+        choices=["METRLA", "PEMSBAY", "TEP", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
         default="METRLA",
     )
     parser.add_argument("--data_root", type=str, default=None, help="Path to dataset root directory.")
@@ -46,6 +58,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_layers", type=int, default=2, help="Number of STGCN blocks.")
     parser.add_argument("--temporal_kernel", type=int, default=3)
     parser.add_argument("--cheb_k", type=int, default=3, help="Chebyshev polynomial order for STGCN/MSTGCN.")
+    parser.add_argument(
+        "--temporal_encoder",
+        type=str,
+        choices=["lstm", "tcn", "transformer"],
+        default="lstm",
+        help="Temporal encoder for causal_forecaster.",
+    )
+    parser.add_argument("--temporal_layers", type=int, default=1, help="Temporal encoder layers for causal_forecaster.")
+    parser.add_argument("--attention_heads", type=int, default=4, help="Attention heads for causal_forecaster.")
+    parser.add_argument("--decoder_layers", type=int, default=2, help="Decoder MLP layers for causal_forecaster.")
+    parser.add_argument("--fusion_rounds", type=int, default=1, help="Causal fusion rounds for causal_forecaster.")
+    parser.add_argument(
+        "--spatial_norm",
+        type=str,
+        choices=["sym", "row"],
+        default="sym",
+        help="Adjacency normalization for causal_forecaster spatial GNN.",
+    )
+    parser.add_argument(
+        "--control_nodes",
+        type=str,
+        default=None,
+        help="Comma-separated global node indices used as control nodes.",
+    )
+    parser.add_argument(
+        "--manip_nodes",
+        type=str,
+        default=None,
+        help="Comma-separated global node indices used as manipulated nodes.",
+    )
+    parser.add_argument(
+        "--target_nodes",
+        type=str,
+        default=None,
+        help="Comma-separated global node indices used as target nodes (subset of manipulated).",
+    )
+    parser.add_argument("--tcn_dilation_base", type=int, default=2, help="TCN dilation base for causal_forecaster.")
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience.")
     parser.add_argument("--device", type=str, default=None)
@@ -101,6 +150,41 @@ def parse_gpu_ids(gpu_string: Optional[str]) -> Optional[List[int]]:
             continue
         ids.append(int(token))
     return ids or None
+
+
+def resolve_dataset_dir(dataset: str, data_root: Optional[str | Path]) -> Path:
+    base = Path(data_root) if data_root is not None else Path(__file__).resolve().parent / "preprocessing" / "data"
+    return base / dataset.upper()
+
+
+def _validate_node_indices(indices: Sequence[int], num_nodes: int, name: str) -> None:
+    invalid = [idx for idx in indices if idx < 0 or idx >= num_nodes]
+    if invalid:
+        raise ValueError(f"{name} contains out-of-range indices: {invalid}")
+
+
+def resolve_node_groups(
+    args: argparse.Namespace,
+    num_nodes: int,
+    dataset_dir: Path,
+) -> Tuple[List[int], List[int], List[int]]:
+    feature_names = load_feature_names(dataset_dir)
+    control_nodes = parse_index_list(args.control_nodes)
+    manip_nodes = parse_index_list(args.manip_nodes)
+    control_indices, manip_indices = infer_node_groups(feature_names, num_nodes, control_nodes, manip_nodes)
+    _validate_node_indices(control_indices, num_nodes, "control_nodes")
+    _validate_node_indices(manip_indices, num_nodes, "manip_nodes")
+    target_nodes = parse_index_list(args.target_nodes)
+    if target_nodes is None:
+        target_indices = list(range(len(manip_indices)))
+    else:
+        _validate_node_indices(target_nodes, num_nodes, "target_nodes")
+        manip_lookup = {node: idx for idx, node in enumerate(manip_indices)}
+        missing = [node for node in target_nodes if node not in manip_lookup]
+        if missing:
+            raise ValueError(f"target_nodes must be a subset of manipulated nodes; missing: {missing}")
+        target_indices = [manip_lookup[node] for node in target_nodes]
+    return control_indices, manip_indices, target_indices
 
 
 def resolve_device(name: str | None, gpu_ids: Optional[List[int]] = None) -> torch.device:
@@ -269,6 +353,37 @@ def build_model(args: argparse.Namespace, bundle: TemporalDatasetBundle, device:
         model = ASTGCN(config, adjacency=adjacency)
         return model.to(device)
 
+    elif args.model == "causal_forecaster":
+        dataset_dir = resolve_dataset_dir(args.dataset, args.data_root)
+        control_indices, manip_indices, target_indices = resolve_node_groups(args, bundle.num_nodes, dataset_dir)
+        config = CausalForecasterConfig(
+            num_nodes=bundle.num_nodes,
+            in_channels=bundle.num_features,
+            hidden_dim=args.hidden_channels,
+            horizon=args.horizon,
+            lag=args.lag,
+            control_indices=control_indices,
+            manipulated_indices=manip_indices,
+            target_indices=target_indices,
+            temporal_encoder=args.temporal_encoder,
+            temporal_layers=args.temporal_layers,
+            temporal_dropout=args.dropout,
+            tcn_kernel_size=args.temporal_kernel,
+            tcn_dilation_base=args.tcn_dilation_base,
+            spatial_layers=args.num_layers,
+            spatial_dropout=args.dropout,
+            spatial_norm=args.spatial_norm,
+            attention_heads=args.attention_heads,
+            attention_dropout=args.dropout,
+            fusion_rounds=args.fusion_rounds,
+            decoder_layers=args.decoder_layers,
+            decoder_dropout=args.dropout,
+            activation="relu",
+            target_channel=args.target_channel,
+        )
+        model = CausalDualStreamForecaster(config, adjacency=adjacency)
+        return model.to(device)
+
 
 def prepare_batch(batch: Tuple[torch.Tensor, torch.Tensor], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     x, y = batch
@@ -277,6 +392,26 @@ def prepare_batch(batch: Tuple[torch.Tensor, torch.Tensor], device: torch.device
     x = x.permute(0, 3, 2, 1).contiguous()  # (batch, features, nodes, lag)
     target = y.permute(0, 2, 1).contiguous()  # (batch, nodes, horizon)
     return x, target
+
+
+def apply_loss_mask(
+    model: torch.nn.Module,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    model_ref = unwrap_model(model)
+    loss_indices = getattr(model_ref, "loss_node_indices", None)
+    if loss_indices is None:
+        return prediction, target
+    if isinstance(loss_indices, torch.Tensor):
+        idx = loss_indices.to(device=target.device)
+    else:
+        idx = torch.tensor(loss_indices, device=target.device, dtype=torch.long)
+    if idx.numel() == 0:
+        return prediction, target
+    prediction = prediction.index_select(1, idx)
+    target = target.index_select(1, idx)
+    return prediction, target
 
 
 def build_lag_weights(lag: int, last_weight_percent: Optional[float]) -> Optional[torch.Tensor]:
@@ -386,7 +521,6 @@ def run_epoch(
 
     for batch in loader:
         x, target = prepare_batch(batch, device)
-        batch_elements = float(target.numel())
         if is_train:
             optimizer.zero_grad()
         with torch.set_grad_enabled(is_train):
@@ -401,12 +535,14 @@ def run_epoch(
             if loss_focus == "last":
                 prediction = prediction[..., -1:]
                 target = target[..., -1:]
+            prediction, target = apply_loss_mask(model, prediction, target)
             loss = criterion(prediction, target)
             if is_train:
                 loss.backward()
                 if grad_clip is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+        batch_elements = float(target.numel())
         abs_error = torch.sum(torch.abs(prediction - target)).item()
         sq_error = torch.sum((prediction - target) ** 2).item()
         total_loss += loss.item() * batch_elements

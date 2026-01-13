@@ -1,0 +1,1 @@
+/home/rashinda/.conda/envs/rashindaNew-torch-env/bin/python main.py diffusion --dataset TEP --data_root /mnt/datassd3/rashinda/CFGenerationForSGNN/CFGenerationForSGNN/preprocessing/data --lag 20 --horizon 20 --batch_size 64 --epochs 400
