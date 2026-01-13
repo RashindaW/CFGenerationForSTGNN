@@ -77,9 +77,6 @@ class ForecastGuidance:
         anchor_weights: Optional[torch.Tensor] = None,
         node_weights: Optional[torch.Tensor] = None,
         neighbor_only_inputs: bool = False,
-        masked_target_node: Optional[int] = None,
-        masked_target_channel: Optional[int] = None,
-        masked_target_value: Optional[torch.Tensor] = None,
         model_type: str = "stgcn",
         lag_weights: Optional[torch.Tensor] = None,
     ) -> None:
@@ -94,9 +91,6 @@ class ForecastGuidance:
         self.upper_bounds = upper_bounds
         self.baseline = baseline.to(device).float().unsqueeze(0) if baseline is not None else None
         self.neighbor_only_inputs = neighbor_only_inputs
-        self.masked_target_node = masked_target_node
-        self.masked_target_channel = masked_target_channel
-        self.masked_target_value = masked_target_value
         self.model_type = model_type
         self.lag_weights = lag_weights
         if anchor_weights is not None:
@@ -138,20 +132,6 @@ class ForecastGuidance:
             was_training = self.forecaster.training
             self.forecaster.train()
             forecaster_input = prepare_forecaster_input(x)
-            if self.masked_target_node is not None and self.masked_target_node >= 0:
-                if self.masked_target_node >= forecaster_input.size(2):
-                    raise ValueError(
-                        f"masked_target_node {self.masked_target_node} is out of range for {forecaster_input.size(2)} nodes"
-                    )
-                forecaster_input = forecaster_input.clone()
-                forecaster_input[:, :, self.masked_target_node, :] = 0.0
-                if (
-                    self.masked_target_value is not None
-                    and self.masked_target_channel is not None
-                    and 0 <= self.masked_target_channel < forecaster_input.size(1)
-                ):
-                    fill = torch.as_tensor(self.masked_target_value, device=forecaster_input.device, dtype=forecaster_input.dtype)
-                    forecaster_input[:, self.masked_target_channel, self.masked_target_node, :] = fill
             prediction = forward_pass(
                 self.forecaster,
                 forecaster_input,

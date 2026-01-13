@@ -241,8 +241,6 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
     parser.add_argument("--spatial_weight", type=float, default=1e-3)
     parser.add_argument("--control_weight", type=float, default=0.0)
     parser.add_argument("--rate_limit", type=float, default=None)
-    parser.add_argument("--clamp_min", type=float, default=None)
-    parser.add_argument("--clamp_max", type=float, default=None)
     parser.add_argument("--lower_bound", type=float, default=None)
     parser.add_argument("--upper_bound", type=float, default=None)
     parser.add_argument("--device", type=str, default=None)
@@ -335,24 +333,6 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         help="Number of lagged time steps to plot (from most recent backwards). If None, plots all available lag steps.",
     )
     parser.add_argument(
-        "--mask_target_history",
-        action="store_true",
-        help="Mask the target node's lag history when using the short-term forecaster during iterative counterfactuals.",
-    )
-    parser.add_argument(
-        "--mask_target_history_mode",
-        type=str,
-        choices=["zeros", "guidance", "alternating", "blend"],
-        default="zeros",
-        help="Strategy for masking the target node history when --mask_target_history is set.",
-    )
-    parser.add_argument(
-        "--mask_target_history_alpha",
-        type=float,
-        default=0.5,
-        help="Guidance weight for --mask_target_history_mode=blend (alpha * guidance + (1-alpha) * forecast).",
-    )
-    parser.add_argument(
         "--metrics_path",
         type=str,
         default=None,
@@ -376,20 +356,6 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         choices=["baseline", "guidance", "adjusted", "original", "actions"],
         default="baseline",
         help="Which series to treat as the input for metrics in iterative guidance.",
-    )
-    parser.add_argument(
-        "--guidance_start_source",
-        type=str,
-        choices=["baseline", "ground_truth", "lag"],
-        default="baseline",
-        help="Select the starting point for the guidance trajectory interpolation.",
-    )
-    parser.add_argument(
-        "--guidance_interpolation",
-        type=str,
-        choices=["linear"],
-        default="linear",
-        help="Interpolation scheme for guidance trajectory (last point is always fixed).",
     )
     parser.add_argument(
         "--cf_horizon",
@@ -443,7 +409,7 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
     parser.add_argument(
         "--guidance_path_strategy",
         type=str,
-        choices=["diffusion", "linear"],
+        choices=["diffusion", "linear", "dc_shift", "step"],
         default="diffusion",
         help="How to construct the guidance trajectory between start (last lag) and adjusted target endpoint.",
     )
@@ -711,55 +677,6 @@ def prepare_target(default_target: torch.Tensor, path: Optional[str]) -> torch.T
     return tensor
 
 
-def mask_target_history_input(
-    forecaster_input: torch.Tensor,
-    target_node: int,
-    target_channel: int,
-    mask_value: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    if target_node < 0:
-        return forecaster_input
-    if forecaster_input.dim() != 4:
-        raise ValueError("forecaster_input must have shape (batch, channels, nodes, lag)")
-    if target_node >= forecaster_input.size(2):
-        raise ValueError(f"target node {target_node} is out of range for {forecaster_input.size(2)} nodes")
-    masked = forecaster_input.clone()
-    masked[:, :, target_node, :] = 0.0
-    if mask_value is not None and 0 <= target_channel < masked.size(1):
-        fill = torch.as_tensor(mask_value, device=masked.device, dtype=masked.dtype)
-        masked[:, target_channel, target_node, :] = fill
-    return masked
-
-
-def compute_mask_target_value(
-    mode: str,
-    step: int,
-    guidance_target: Optional[torch.Tensor],
-    iterative_predictions: Optional[torch.Tensor],
-    target_node: int,
-    alpha: float,
-) -> Optional[torch.Tensor]:
-    if mode == "zeros":
-        return None
-    if guidance_target is None:
-        raise ValueError("guidance_target is required for non-zero mask_target_history modes.")
-    if target_node < 0 or target_node >= guidance_target.size(0):
-        raise ValueError(f"target node {target_node} is out of range for {guidance_target.size(0)} nodes")
-    guidance_idx = max(step - 1, 0)
-    guidance_val = guidance_target[target_node, guidance_idx]
-    forecast_val = guidance_val
-    if iterative_predictions is not None and step > 0:
-        forecast_val = iterative_predictions[target_node, step - 1]
-    if mode == "guidance":
-        return guidance_val
-    if mode == "alternating":
-        return guidance_val if step % 2 == 1 else forecast_val
-    if mode == "blend":
-        alpha_val = float(alpha)
-        return guidance_val * alpha_val + forecast_val * (1.0 - alpha_val)
-    raise ValueError(f"Unknown mask_target_history_mode {mode}")
-
-
 def adjust_target(
     target: torch.Tensor,
     percent: float,
@@ -965,6 +882,82 @@ def build_linear_guidance_target(
         interp = start_val + (end_val - start_val) * steps
         interp[-1] = end_val
         guidance[node] = interp
+
+    return guidance
+
+
+def build_dc_shift_guidance_target(
+    baseline: torch.Tensor,
+    adjusted_target: torch.Tensor,
+    past_window: torch.Tensor,
+    target_node: int,
+    target_channel: int,
+) -> torch.Tensor:
+    """
+    Use a flat guidance path at the adjusted target endpoint for the chosen node(s);
+    other nodes follow the baseline forecast.
+    """
+
+    if baseline.shape != adjusted_target.shape:
+        raise ValueError("baseline and adjusted_target must share the same shape for DC-shift guidance")
+    horizon = baseline.shape[1]
+    if horizon == 0:
+        return baseline.clone()
+
+    num_nodes = baseline.shape[0]
+    if target_node >= num_nodes or target_node < -1:
+        raise ValueError(f"target_adjust_node {target_node} is out of range for {num_nodes} nodes")
+    if target_channel < 0 or target_channel >= past_window.shape[-1]:
+        raise ValueError(f"target_channel {target_channel} is out of range for past window features {past_window.shape[-1]}")
+
+    guidance = baseline.clone()
+    target_nodes = range(num_nodes) if target_node < 0 else [target_node]
+
+    for node in target_nodes:
+        end_val = adjusted_target[node, -1].to(baseline.device, baseline.dtype)
+        guidance[node] = end_val
+
+    return guidance
+
+
+def build_step_guidance_target(
+    baseline: torch.Tensor,
+    adjusted_target: torch.Tensor,
+    past_window: torch.Tensor,
+    target_node: int,
+    target_channel: int,
+) -> torch.Tensor:
+    """
+    Hold the last observed lag value for half the horizon, then step to the adjusted target.
+    """
+
+    if baseline.shape != adjusted_target.shape:
+        raise ValueError("baseline and adjusted_target must share the same shape for step guidance")
+    horizon = baseline.shape[1]
+    if horizon == 0:
+        return baseline.clone()
+
+    num_nodes = baseline.shape[0]
+    if target_node >= num_nodes or target_node < -1:
+        raise ValueError(f"target_adjust_node {target_node} is out of range for {num_nodes} nodes")
+    if target_channel < 0 or target_channel >= past_window.shape[-1]:
+        raise ValueError(f"target_channel {target_channel} is out of range for past window features {past_window.shape[-1]}")
+
+    guidance = baseline.clone()
+    start_values = past_window[-1, :, target_channel].to(baseline.device, baseline.dtype)
+    target_nodes = range(num_nodes) if target_node < 0 else [target_node]
+
+    if horizon == 1:
+        for node in target_nodes:
+            guidance[node, 0] = adjusted_target[node, -1].to(baseline.device, baseline.dtype)
+        return guidance
+
+    step_idx = max(1, horizon // 2)
+    for node in target_nodes:
+        start_val = start_values[node]
+        end_val = adjusted_target[node, -1].to(baseline.device, baseline.dtype)
+        guidance[node, :step_idx] = start_val
+        guidance[node, step_idx:] = end_val
 
     return guidance
 
@@ -1808,6 +1801,22 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 args.target_adjust_node,
                 target_ch,
             )
+        elif args.guidance_path_strategy == "dc_shift":
+            guidance_target = build_dc_shift_guidance_target(
+                baseline_forecast,
+                adjusted_target,
+                past_window,
+                args.target_adjust_node,
+                target_ch,
+            )
+        elif args.guidance_path_strategy == "step":
+            guidance_target = build_step_guidance_target(
+                baseline_forecast,
+                adjusted_target,
+                past_window,
+                args.target_adjust_node,
+                target_ch,
+            )
         else:
             guidance_target = build_diffusion_guidance_target(
                 baseline_forecast,
@@ -1857,8 +1866,6 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         spatial_weight=args.spatial_weight,
         control_energy_weight=args.control_weight,
         rate_limit=args.rate_limit,
-        clamp_min=args.clamp_min,
-        clamp_max=args.clamp_max,
         anchor_start_weight=args.anchor_start_weight,
         anchor_end_weight=args.anchor_end_weight,
         anchor_loss_scale=args.anchor_loss_scale,
@@ -1916,23 +1923,24 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         edit_mask = edit_mask * base_mask
         edit_mask = edit_mask.to(device)
 
+        # Identify control nodes vs dependent nodes based on edit mask
+        # Control nodes: can be perturbed (edit_mask is non-zero at last timestep)
+        # Dependent nodes: cannot be perturbed (edit_mask is zero, includes target node)
+        node_is_control = (edit_mask[-1].sum(dim=-1) > 0)  # Shape (N,)
+        node_is_dependent = ~node_is_control  # Shape (N,)
+
         for step in range(iter_steps):
-            if 0 <= target_ch < current_window.shape[-1]:
-                iterative_prev_last_lag[:, step] = current_window[-1, :, target_ch]
-            mask_value = None
-            if args.mask_target_history and args.target_adjust_node >= 0:
-                mask_value = compute_mask_target_value(
-                    args.mask_target_history_mode,
-                    step,
-                    target_series,
-                    iterative_predictions,
-                    args.target_adjust_node,
-                    args.mask_target_history_alpha,
-                )
+            # Step 1: Shift left and duplicate last value for perturbation
+            # This creates a window where position T-1 is a copy of position T-2
+            shifted_window = torch.cat([current_window[1:], current_window[-1:].clone()], dim=0)
+
+            # Record pre-perturbation value (from the duplicated last position)
+            if 0 <= target_ch < shifted_window.shape[-1]:
+                iterative_prev_last_lag[:, step] = shifted_window[-1, :, target_ch]
+
+            # Get baseline prediction from shifted window (before perturbation)
             with torch.no_grad():
-                step_input = prepare_forecaster_input(current_window.unsqueeze(0))
-                if args.mask_target_history and args.target_adjust_node >= 0:
-                    step_input = mask_target_history_input(step_input, args.target_adjust_node, target_ch, mask_value)
+                step_input = prepare_forecaster_input(shifted_window.unsqueeze(0))
                 step_pred = forecaster_module.forward_pass(
                     short_forecaster,
                     step_input,
@@ -1967,14 +1975,12 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 anchor_weights=anchor_step,
                 node_weights=node_weights,
                 neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
-                masked_target_node=args.target_adjust_node if args.mask_target_history else None,
-                masked_target_channel=target_ch if args.mask_target_history else None,
-                masked_target_value=mask_value if args.mask_target_history else None,
                 model_type=short_model_type,
                 lag_weights=short_meta.get("lag_weights"),
             )
 
-            fixed_values = current_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
+            # Step 2: Perturb the shifted window (only last position is editable)
+            fixed_values = shifted_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
             warm_start = fixed_values if args.warm_start else None
             samples = generator.generate(
                 sample_shape=sample_shape,
@@ -1986,10 +1992,9 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 fixed_values=fixed_values,
             )
 
+            # Evaluate samples and select best based on forecast MSE
             with torch.no_grad():
                 cf_input = prepare_forecaster_input(samples)
-                if args.mask_target_history and args.target_adjust_node >= 0:
-                    cf_input = mask_target_history_input(cf_input, args.target_adjust_node, target_ch, mask_value)
                 cf_preds = forecaster_module.forward_pass(
                     short_forecaster,
                     cf_input,
@@ -2016,10 +2021,16 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 iterative_edited_last_lag[:, step] = best_window[-1, :, target_ch]
             best_windows.append(best_window.detach().cpu())
 
-            next_step = best_window[-1].clone()
+            # Step 3: Construct f*(T) - hybrid of perturbed control values and forecasted dependent values
+            # - Control nodes: keep perturbed values from best_window[-1] (all features)
+            # - Dependent nodes: use forecast for target channel, perturbed values for other channels
+            #   (other channels of dependent nodes are unchanged since they weren't editable)
+            next_step = best_window[-1].clone()  # Start with all perturbed values (correct for control nodes)
             if 0 <= target_ch < next_step.shape[-1]:
-                next_step[:, target_ch] = best_pred.squeeze(-1)
-            current_window = torch.cat([best_window[1:], next_step.unsqueeze(0)], dim=0)
+                # Only update dependent nodes' target channel with forecast
+                # Control nodes keep their perturbed values for all features
+                next_step[node_is_dependent, target_ch] = best_pred[node_is_dependent, 0]
+            current_window = torch.cat([current_window[1:], next_step.unsqueeze(0)], dim=0)
 
         iterative_predictions_cpu = iterative_predictions.detach().cpu()
         iterative_prev_last_lag_cpu = iterative_prev_last_lag.detach().cpu()
@@ -2171,9 +2182,6 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             "control_node_action_paths": [str(path) for path in control_action_paths] if control_action_paths else None,
             "metrics_input": args.metrics_input,
             "metrics_eps": args.metrics_eps,
-            "mask_target_history": args.mask_target_history,
-            "mask_target_history_mode": args.mask_target_history_mode,
-            "mask_target_history_alpha": args.mask_target_history_alpha,
             "counterfactual_mse": None,
             "best_sample_index": None,
             "best_counterfactual_prediction": iterative_predictions_cpu,
@@ -2331,9 +2339,6 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         "use_predicted_target": args.use_predicted_target,
         "plot_path": str(plot_path),
         "top_cf_window_plot_path": str(top_window_plot_path) if top_window_plot_path else None,
-        "mask_target_history": args.mask_target_history,
-        "mask_target_history_mode": args.mask_target_history_mode,
-        "mask_target_history_alpha": args.mask_target_history_alpha,
         "counterfactual_mse": mse_cpu,
         "best_sample_index": best_idx,
         "best_counterfactual_prediction": best_cf_prediction,
