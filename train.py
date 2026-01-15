@@ -394,6 +394,26 @@ def prepare_batch(batch: Tuple[torch.Tensor, torch.Tensor], device: torch.device
     return x, target
 
 
+def mask_dependent_last_lag(
+    x: torch.Tensor,
+    dependent_indices: List[int],
+) -> torch.Tensor:
+    """Mask the last lag position for dependent nodes with 0.
+
+    Args:
+        x: Input tensor of shape (batch, features, nodes, lag)
+        dependent_indices: List of node indices to mask
+
+    Returns:
+        Tensor with last lag position masked for dependent nodes
+    """
+    if not dependent_indices:
+        return x
+    x = x.clone()
+    x[:, :, dependent_indices, -1] = 0.0
+    return x
+
+
 def apply_loss_mask(
     model: torch.nn.Module,
     prediction: torch.Tensor,
@@ -510,6 +530,8 @@ def run_epoch(
     lag_weights: Optional[torch.Tensor] = None,
     adjacency: Optional[torch.Tensor] = None,
     neighbor_only_inputs: bool = False,
+    dependent_indices: Optional[List[int]] = None,
+    horizon: int = 1,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
@@ -521,6 +543,9 @@ def run_epoch(
 
     for batch in loader:
         x, target = prepare_batch(batch, device)
+        # Mask dependent nodes' last lag position when training with horizon=1
+        if horizon == 1 and dependent_indices:
+            x = mask_dependent_last_lag(x, dependent_indices)
         if is_train:
             optimizer.zero_grad()
         with torch.set_grad_enabled(is_train):
@@ -703,6 +728,16 @@ def test_pipeline(args: argparse.Namespace) -> None:
     )
     lag_weights = build_lag_weights(lag, lag_last_weight_percent)
     neighbor_only_inputs = checkpoint_args.get("neighbor_only_inputs", False) if checkpoint_args else False
+
+    # Resolve dependent node indices for masking when horizon=1
+    dependent_indices: Optional[List[int]] = None
+    if horizon == 1:
+        dataset_dir = resolve_dataset_dir(dataset_name, data_root)
+        resolve_args = model_args if checkpoint_args else args
+        control_indices, _, _ = resolve_node_groups(resolve_args, bundle.num_nodes, dataset_dir)
+        control_set = set(control_indices)
+        dependent_indices = [i for i in range(bundle.num_nodes) if i not in control_set]
+
     test_stats = run_epoch(
         model,
         loaders["test"],
@@ -713,6 +748,8 @@ def test_pipeline(args: argparse.Namespace) -> None:
         lag_weights=lag_weights,
         adjacency=bundle.adjacency,
         neighbor_only_inputs=neighbor_only_inputs,
+        dependent_indices=dependent_indices,
+        horizon=horizon,
     )
     pbar.update(1)
     pbar.close()
@@ -762,6 +799,14 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     lag_weights = build_lag_weights(args.lag, args.lag_last_weight_percent)
 
+    # Resolve dependent node indices for masking when horizon=1
+    dependent_indices: Optional[List[int]] = None
+    if args.horizon == 1:
+        dataset_dir = resolve_dataset_dir(args.dataset, args.data_root)
+        control_indices, _, _ = resolve_node_groups(args, bundle.num_nodes, dataset_dir)
+        control_set = set(control_indices)
+        dependent_indices = [i for i in range(bundle.num_nodes) if i not in control_set]
+
     run_dir = Path(getattr(args, "resolved_run_dir"))
     checkpoint_path = Path(getattr(args, "resolved_checkpoint_path"))
     metrics_path = Path(getattr(args, "metrics_csv_path"))
@@ -788,6 +833,8 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             lag_weights=lag_weights,
             adjacency=bundle.adjacency,
             neighbor_only_inputs=args.neighbor_only_inputs,
+            dependent_indices=dependent_indices,
+            horizon=args.horizon,
         )
         val_stats = run_epoch(
             model,
@@ -800,6 +847,8 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             lag_weights=lag_weights,
             adjacency=bundle.adjacency,
             neighbor_only_inputs=args.neighbor_only_inputs,
+            dependent_indices=dependent_indices,
+            horizon=args.horizon,
         )
 
         if rank == 0:
