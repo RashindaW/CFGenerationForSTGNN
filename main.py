@@ -1928,19 +1928,72 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         # Dependent nodes: cannot be perturbed (edit_mask is zero, includes target node)
         node_is_control = (edit_mask[-1].sum(dim=-1) > 0)  # Shape (N,)
         node_is_dependent = ~node_is_control  # Shape (N,)
+        control_indices = torch.where(node_is_control)[0]  # Indices of control nodes
+        dependent_indices = torch.where(node_is_dependent)[0]  # Indices of dependent nodes
+
+        # Initialize separate tracking for control and dependent nodes
+        # Control window: tracks control node values with perturbations
+        lag_len = past_window.shape[0]  # T
+        control_window = past_window.to(device).float()[:, control_indices, :].clone()  # (T, num_control, F)
+        # Dependent buffer: stores original dependent values (will be augmented with forecasts)
+        dependent_buffer = past_window.to(device).float()[:, dependent_indices, :].clone()  # (T, num_dep, F)
+        # Forecast list: stores F(T), F(T+1), ... for dependent nodes
+        forecast_list: list[torch.Tensor] = []
 
         for step in range(iter_steps):
-            # Step 1: Shift left and duplicate last value for perturbation
-            # This creates a window where position T-1 is a copy of position T-2
-            shifted_window = torch.cat([current_window[1:], current_window[-1:].clone()], dim=0)
+            # === Build perturbation window ===
+            # Control nodes: shift left + duplicate last perturbed value
+            # Dependent nodes: use buffer/forecasts + mask last position with 0
 
-            # Record pre-perturbation value (from the duplicated last position)
-            if 0 <= target_ch < shifted_window.shape[-1]:
-                iterative_prev_last_lag[:, step] = shifted_window[-1, :, target_ch]
+            # Build control portion of perturbation window
+            if step == 0:
+                # Step 0: no shift needed for control, just use original
+                control_perturb = control_window.clone()  # (T, num_control, F)
+            else:
+                # Step 1+: shift left + duplicate last perturbed value
+                control_perturb = torch.cat([control_window[1:], control_window[-1:].clone()], dim=0)
 
-            # Get baseline prediction from shifted window (before perturbation)
+            # Build dependent portion of perturbation window
+            if step == 0:
+                # Step 0: [lag_0, ..., lag_(T-2), 0]
+                dep_perturb = dependent_buffer.clone()
+                dep_perturb[-1, :, :] = 0.0  # Mask last position
+            elif step == 1:
+                # Step 1: [lag_1, ..., lag_(T-1), 0] - shift and restore original T-1
+                dep_perturb = torch.cat([dependent_buffer[1:], torch.zeros_like(dependent_buffer[-1:])], dim=0)
+            else:
+                # Step 2+: [lag_k, ..., F(T), F(T+1), ..., 0] - use forecasts
+                # Build window from remaining original lags + forecasts
+                num_original_remaining = max(0, lag_len - step)
+                dep_perturb = torch.zeros((lag_len, len(dependent_indices), dependent_buffer.shape[-1]), device=device)
+
+                if num_original_remaining > 0:
+                    # Copy remaining original values (shifted)
+                    dep_perturb[:num_original_remaining] = dependent_buffer[step:step + num_original_remaining]
+
+                # Fill with forecasts where original lags are exhausted
+                num_forecasts_to_use = min(len(forecast_list), lag_len - 1 - num_original_remaining)
+                for i in range(num_forecasts_to_use):
+                    pos = num_original_remaining + i
+                    if pos < lag_len - 1:  # Don't overwrite last position (will be masked)
+                        # forecast_list[i] has shape (1, N, 1), extract dependent nodes
+                        dep_perturb[pos, :, :] = forecast_list[i][0, dependent_indices, :]
+
+                # Last position is always masked with 0
+                dep_perturb[-1, :, :] = 0.0
+
+            # Combine control and dependent into full perturbation window
+            perturb_window = torch.zeros((lag_len, bundle.num_nodes, bundle.num_features), device=device)
+            perturb_window[:, control_indices, :] = control_perturb
+            perturb_window[:, dependent_indices, :] = dep_perturb
+
+            # Record pre-perturbation value
+            if 0 <= target_ch < perturb_window.shape[-1]:
+                iterative_prev_last_lag[:, step] = perturb_window[-1, :, target_ch]
+
+            # Get baseline prediction (before perturbation)
             with torch.no_grad():
-                step_input = prepare_forecaster_input(shifted_window.unsqueeze(0))
+                step_input = prepare_forecaster_input(perturb_window.unsqueeze(0))
                 step_pred = forecaster_module.forward_pass(
                     short_forecaster,
                     step_input,
@@ -1979,8 +2032,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 lag_weights=short_meta.get("lag_weights"),
             )
 
-            # Step 2: Perturb the shifted window (only last position is editable)
-            fixed_values = shifted_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
+            # === Run perturbation (only control nodes at last position are editable) ===
+            fixed_values = perturb_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
             warm_start = fixed_values if args.warm_start else None
             samples = generator.generate(
                 sample_shape=sample_shape,
@@ -1991,6 +2044,10 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 edit_mask=mask_batched,
                 fixed_values=fixed_values,
             )
+
+            # === Build forecaster input with perturbed control values ===
+            # Control nodes: use perturbed values from samples
+            # Dependent nodes: same as perturbation input (masked at last position)
 
             # Evaluate samples and select best based on forecast MSE
             with torch.no_grad():
@@ -2012,7 +2069,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
 
             best_idx = int(torch.argmin(mse).item())
             best_indices.append(best_idx)
-            best_pred = cf_preds[best_idx]
+            best_pred = cf_preds[best_idx]  # Shape: (N, 1)
             iterative_predictions[:, step] = best_pred.squeeze(-1)
             mse_per_step.append(float(mse[best_idx].item()))
 
@@ -2021,16 +2078,25 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 iterative_edited_last_lag[:, step] = best_window[-1, :, target_ch]
             best_windows.append(best_window.detach().cpu())
 
-            # Step 3: Construct f*(T) - hybrid of perturbed control values and forecasted dependent values
-            # - Control nodes: keep perturbed values from best_window[-1] (all features)
-            # - Dependent nodes: use forecast for target channel, perturbed values for other channels
-            #   (other channels of dependent nodes are unchanged since they weren't editable)
-            next_step = best_window[-1].clone()  # Start with all perturbed values (correct for control nodes)
-            if 0 <= target_ch < next_step.shape[-1]:
-                # Only update dependent nodes' target channel with forecast
-                # Control nodes keep their perturbed values for all features
-                next_step[node_is_dependent, target_ch] = best_pred[node_is_dependent, 0]
-            current_window = torch.cat([current_window[1:], next_step.unsqueeze(0)], dim=0)
+            # === Store forecast for dependent nodes ===
+            # best_pred has shape (N, 1), we store it for use in future steps
+            forecast_list.append(best_pred.unsqueeze(0))  # Shape: (1, N, 1)
+
+            # === Update control window with perturbed values ===
+            # Extract perturbed control values and update control_window
+            perturbed_control = best_window[:, control_indices, :]  # (T, num_control, F)
+            if step == 0:
+                # Step 0: just update with perturbed values
+                control_window = perturbed_control.clone()
+            else:
+                # Step 1+: the perturbed window was shifted+duplicated, now update
+                control_window = perturbed_control.clone()
+
+        # Reconstruct current_window from control and dependent portions for final output
+        current_window = torch.zeros((lag_len, bundle.num_nodes, bundle.num_features), device=device)
+        current_window[:, control_indices, :] = control_window
+        # For dependent nodes, use the last perturbation window's dependent portion
+        current_window[:, dependent_indices, :] = dep_perturb
 
         iterative_predictions_cpu = iterative_predictions.detach().cpu()
         iterative_prev_last_lag_cpu = iterative_prev_last_lag.detach().cpu()
