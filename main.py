@@ -35,6 +35,7 @@ from counterfactual.subgraph import (
     random_walk_subgraph,
     save_subgraphs,
 )
+from control import CausalController
 from models.causal_forecaster import load_feature_names
 from preprocessing.data_reader import TemporalDatasetBundle, load_dataset
 from preprocessing.graphwavenet_utils import StandardScaler
@@ -446,6 +447,44 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         choices=["diffusion", "linear"],
         default="diffusion",
         help="How to construct the guidance trajectory between start (last lag) and adjusted target endpoint.",
+    )
+    # Control method arguments
+    parser.add_argument(
+        "--control_method",
+        type=str,
+        choices=["diffusion", "gradient", "jacobian"],
+        default="diffusion",
+        help="Method for generating counterfactual control inputs.",
+    )
+    parser.add_argument(
+        "--gradient_steps",
+        type=int,
+        default=100,
+        help="Number of optimization steps for gradient-based control.",
+    )
+    parser.add_argument(
+        "--gradient_lr",
+        type=float,
+        default=0.01,
+        help="Learning rate for gradient-based control.",
+    )
+    parser.add_argument(
+        "--gradient_reg",
+        type=float,
+        default=0.1,
+        help="Regularization weight for minimal intervention in gradient-based control.",
+    )
+    parser.add_argument(
+        "--jacobian_reg",
+        type=float,
+        default=1e-4,
+        help="Tikhonov regularization for Jacobian pseudo-inverse.",
+    )
+    parser.add_argument(
+        "--jacobian_max_delta",
+        type=float,
+        default=None,
+        help="Maximum allowed change magnitude per control node for Jacobian method.",
     )
     parser.set_defaults(handler=run_counterfactual_command)
     return parser
@@ -1916,6 +1955,57 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         edit_mask = edit_mask * base_mask
         edit_mask = edit_mask.to(device)
 
+        # Setup for gradient/jacobian control methods
+        controller = None
+        control_indices = None
+        if args.control_method in ("gradient", "jacobian"):
+            # Get control node indices (for TEP: XMV variables)
+            control_indices_np = resolve_tep_control_nodes(
+                dataset_meta.get("dataset", ""),
+                args.data_root,
+                bundle.num_nodes,
+            )
+            if control_indices_np.size == 0:
+                # Fallback: use last 11 nodes as controls if not TEP or no XMV found
+                control_indices_np = np.arange(max(0, bundle.num_nodes - 11), bundle.num_nodes)
+            control_indices = torch.tensor(control_indices_np, device=device, dtype=torch.long)
+
+            # Target indices: the node we want to adjust
+            if args.target_adjust_node >= 0:
+                target_indices = torch.tensor([args.target_adjust_node], device=device, dtype=torch.long)
+            else:
+                # All manipulated (non-control) nodes are targets
+                all_nodes = set(range(bundle.num_nodes))
+                manip_nodes = sorted(all_nodes - set(control_indices_np.tolist()))
+                target_indices = torch.tensor(manip_nodes, device=device, dtype=torch.long)
+
+            # Create the controller
+            method_kwargs = {}
+            if args.control_method == "gradient":
+                method_kwargs = {
+                    "n_steps": args.gradient_steps,
+                    "lr": args.gradient_lr,
+                    "lambda_reg": args.gradient_reg,
+                }
+            elif args.control_method == "jacobian":
+                method_kwargs = {
+                    "regularization": args.jacobian_reg,
+                    "max_delta": args.jacobian_max_delta,
+                }
+
+            controller = CausalController(
+                forecaster=short_forecaster,
+                control_indices=control_indices,
+                target_indices=target_indices,
+                adjacency=short_bundle.adjacency.to(device),
+                method=args.control_method,
+                x_bounds=(args.lower_bound, args.upper_bound) if args.lower_bound is not None or args.upper_bound is not None else None,
+                model_type=short_model_type,
+                lag_weights=short_meta.get("lag_weights"),
+                neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
+                **method_kwargs,
+            )
+
         for step in range(iter_steps):
             if 0 <= target_ch < current_window.shape[-1]:
                 iterative_prev_last_lag[:, step] = current_window[-1, :, target_ch]
@@ -1950,72 +2040,128 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             step_target = target_series[:, step : step + 1]
             iterative_targets[:, step] = step_target.squeeze(-1)
 
-            target_batched = step_target.unsqueeze(0).repeat(args.samples, 1, 1)
-            mask_batched = edit_mask.unsqueeze(0).repeat(args.samples, 1, 1, 1)
+            if args.control_method == "diffusion":
+                # Diffusion-based generation (original method)
+                target_batched = step_target.unsqueeze(0).repeat(args.samples, 1, 1)
+                mask_batched = edit_mask.unsqueeze(0).repeat(args.samples, 1, 1, 1)
 
-            baseline_step = step_pred
-            anchor_step = anchor_weights[step : step + 1] if anchor_weights is not None else None
-            guidance = ForecastGuidance(
-                forecaster=short_forecaster,
-                target=target_batched,
-                mask=mask_batched,
-                adjacency=bundle.adjacency.to(device),
-                config=guidance_config,
-                lower_bounds=args.lower_bound,
-                upper_bounds=args.upper_bound,
-                baseline=baseline_step,
-                anchor_weights=anchor_step,
-                node_weights=node_weights,
-                neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
-                masked_target_node=args.target_adjust_node if args.mask_target_history else None,
-                masked_target_channel=target_ch if args.mask_target_history else None,
-                masked_target_value=mask_value if args.mask_target_history else None,
-                model_type=short_model_type,
-                lag_weights=short_meta.get("lag_weights"),
-            )
-
-            fixed_values = current_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
-            warm_start = fixed_values if args.warm_start else None
-            samples = generator.generate(
-                sample_shape=sample_shape,
-                guidance=guidance,
-                num_samples=args.samples,
-                max_steps=args.max_steps,
-                warm_start=warm_start,
-                edit_mask=mask_batched,
-                fixed_values=fixed_values,
-            )
-
-            with torch.no_grad():
-                cf_input = prepare_forecaster_input(samples)
-                if args.mask_target_history and args.target_adjust_node >= 0:
-                    cf_input = mask_target_history_input(cf_input, args.target_adjust_node, target_ch, mask_value)
-                cf_preds = forecaster_module.forward_pass(
-                    short_forecaster,
-                    cf_input,
-                    short_model_type,
-                    lag_weights=short_meta.get("lag_weights"),
-                    adjacency=short_bundle.adjacency,
+                baseline_step = step_pred
+                anchor_step = anchor_weights[step : step + 1] if anchor_weights is not None else None
+                guidance = ForecastGuidance(
+                    forecaster=short_forecaster,
+                    target=target_batched,
+                    mask=mask_batched,
+                    adjacency=bundle.adjacency.to(device),
+                    config=guidance_config,
+                    lower_bounds=args.lower_bound,
+                    upper_bounds=args.upper_bound,
+                    baseline=baseline_step,
+                    anchor_weights=anchor_step,
+                    node_weights=node_weights,
                     neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
+                    masked_target_node=args.target_adjust_node if args.mask_target_history else None,
+                    masked_target_channel=target_ch if args.mask_target_history else None,
+                    masked_target_value=mask_value if args.mask_target_history else None,
+                    model_type=short_model_type,
+                    lag_weights=short_meta.get("lag_weights"),
                 )
-                if cf_preds.dim() == 2:
-                    cf_preds = cf_preds.unsqueeze(-1)
-                cf_preds = cf_preds[:, :, :1]
-                diff_sq = (cf_preds - target_batched) ** 2
-                per_node = diff_sq.mean(dim=2)
-                mse = (per_node * node_w.view(1, -1)).sum(dim=1)
 
-            best_idx = int(torch.argmin(mse).item())
-            best_indices.append(best_idx)
-            best_pred = cf_preds[best_idx]
-            iterative_predictions[:, step] = best_pred.squeeze(-1)
-            mse_per_step.append(float(mse[best_idx].item()))
+                fixed_values = current_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
+                warm_start = fixed_values if args.warm_start else None
+                samples = generator.generate(
+                    sample_shape=sample_shape,
+                    guidance=guidance,
+                    num_samples=args.samples,
+                    max_steps=args.max_steps,
+                    warm_start=warm_start,
+                    edit_mask=mask_batched,
+                    fixed_values=fixed_values,
+                )
 
-            best_window = samples[best_idx]
-            if 0 <= target_ch < best_window.shape[-1]:
-                iterative_edited_last_lag[:, step] = best_window[-1, :, target_ch]
-            best_windows.append(best_window.detach().cpu())
+                with torch.no_grad():
+                    cf_input = prepare_forecaster_input(samples)
+                    if args.mask_target_history and args.target_adjust_node >= 0:
+                        cf_input = mask_target_history_input(cf_input, args.target_adjust_node, target_ch, mask_value)
+                    cf_preds = forecaster_module.forward_pass(
+                        short_forecaster,
+                        cf_input,
+                        short_model_type,
+                        lag_weights=short_meta.get("lag_weights"),
+                        adjacency=short_bundle.adjacency,
+                        neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
+                    )
+                    if cf_preds.dim() == 2:
+                        cf_preds = cf_preds.unsqueeze(-1)
+                    cf_preds = cf_preds[:, :, :1]
+                    target_batched_cmp = step_target.unsqueeze(0).repeat(args.samples, 1, 1)
+                    diff_sq = (cf_preds - target_batched_cmp) ** 2
+                    per_node = diff_sq.mean(dim=2)
+                    mse = (per_node * node_w.view(1, -1)).sum(dim=1)
 
+                best_idx = int(torch.argmin(mse).item())
+                best_indices.append(best_idx)
+                best_pred = cf_preds[best_idx]
+                iterative_predictions[:, step] = best_pred.squeeze(-1)
+                mse_per_step.append(float(mse[best_idx].item()))
+
+                best_window = samples[best_idx]
+                if 0 <= target_ch < best_window.shape[-1]:
+                    iterative_edited_last_lag[:, step] = best_window[-1, :, target_ch]
+                best_windows.append(best_window.detach().cpu())
+
+            else:
+                # Gradient or Jacobian-based control method
+                # Get target for the specific target nodes
+                if args.target_adjust_node >= 0:
+                    y_desired = step_target[args.target_adjust_node : args.target_adjust_node + 1, :]
+                else:
+                    # Use all non-control nodes as targets
+                    all_nodes = set(range(bundle.num_nodes))
+                    manip_nodes = sorted(all_nodes - set(control_indices.cpu().numpy().tolist()))
+                    y_desired = step_target[manip_nodes, :]
+
+                # Find optimal control
+                result = controller.control(
+                    current_window=current_window,
+                    y_desired=y_desired,
+                    target_channel=target_ch,
+                )
+
+                # Apply control to window
+                best_window = controller.apply_control(current_window, result["x_optimal"])
+
+                # Get prediction with controlled window
+                with torch.no_grad():
+                    cf_input = prepare_forecaster_input(best_window.unsqueeze(0))
+                    if args.mask_target_history and args.target_adjust_node >= 0:
+                        cf_input = mask_target_history_input(cf_input, args.target_adjust_node, target_ch, mask_value)
+                    cf_pred = forecaster_module.forward_pass(
+                        short_forecaster,
+                        cf_input,
+                        short_model_type,
+                        lag_weights=short_meta.get("lag_weights"),
+                        adjacency=short_bundle.adjacency,
+                        neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
+                    )
+                    if cf_pred.dim() == 2:
+                        cf_pred = cf_pred.unsqueeze(-1)
+                    cf_pred = cf_pred[:, :, :1]
+
+                best_pred = cf_pred.squeeze(0)
+                iterative_predictions[:, step] = best_pred.squeeze(-1)
+
+                # Compute MSE for this step
+                diff_sq = (best_pred - step_target) ** 2
+                per_node = diff_sq.mean(dim=1)
+                mse_step = (per_node * node_w).sum()
+                mse_per_step.append(float(mse_step.item()))
+                best_indices.append(0)  # No sample selection for controller methods
+
+                if 0 <= target_ch < best_window.shape[-1]:
+                    iterative_edited_last_lag[:, step] = best_window[-1, :, target_ch]
+                best_windows.append(best_window.detach().cpu())
+
+            # Update window for next iteration
             next_step = best_window[-1].clone()
             if 0 <= target_ch < next_step.shape[-1]:
                 next_step[:, target_ch] = best_pred.squeeze(-1)
