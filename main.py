@@ -211,7 +211,8 @@ def add_subgraph_subcommand(subparsers: argparse._SubParsersAction[argparse.Argu
 def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> argparse.ArgumentParser:
     parser = subparsers.add_parser("counterfactual", help="Generate diffusion-guided counterfactual past windows.")
     parser.add_argument("--forecaster_checkpoint", type=str, required=True)
-    parser.add_argument("--diffusion_checkpoint", type=str, required=True)
+    parser.add_argument("--diffusion_checkpoint", type=str, default=None,
+                        help="Diffusion model checkpoint (required for --control_method diffusion).")
     parser.add_argument(
         "--short_forecaster_checkpoint",
         type=str,
@@ -444,7 +445,7 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
     parser.add_argument(
         "--guidance_path_strategy",
         type=str,
-        choices=["diffusion", "linear"],
+        choices=["diffusion", "linear", "step", "dc_shift"],
         default="diffusion",
         help="How to construct the guidance trajectory between start (last lag) and adjusted target endpoint.",
     )
@@ -452,7 +453,7 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
     parser.add_argument(
         "--control_method",
         type=str,
-        choices=["diffusion", "gradient", "jacobian"],
+        choices=["diffusion", "gradient", "jacobian", "perturbation"],
         default="diffusion",
         help="Method for generating counterfactual control inputs.",
     )
@@ -485,6 +486,37 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         type=float,
         default=None,
         help="Maximum allowed change magnitude per control node for Jacobian method.",
+    )
+    # Perturbation method arguments
+    parser.add_argument(
+        "--perturbation_samples",
+        type=int,
+        default=200,
+        help="Number of random perturbation samples in Phase 1 (random search).",
+    )
+    parser.add_argument(
+        "--perturbation_scale",
+        type=float,
+        default=0.1,
+        help="Scale for uniform sampling: U(-scale, scale) in random search.",
+    )
+    parser.add_argument(
+        "--perturbation_refine_steps",
+        type=int,
+        default=50,
+        help="Number of gradient descent iterations in Phase 2 (refinement).",
+    )
+    parser.add_argument(
+        "--perturbation_refine_lr",
+        type=float,
+        default=0.01,
+        help="Learning rate for finite differences refinement.",
+    )
+    parser.add_argument(
+        "--perturbation_eps",
+        type=float,
+        default=1e-4,
+        help="Epsilon for numerical gradient computation via finite differences.",
     )
     parser.set_defaults(handler=run_counterfactual_command)
     return parser
@@ -1004,6 +1036,75 @@ def build_linear_guidance_target(
         interp = start_val + (end_val - start_val) * steps
         interp[-1] = end_val
         guidance[node] = interp
+
+    return guidance
+
+
+def build_step_guidance_target(
+    baseline: torch.Tensor,
+    adjusted_target: torch.Tensor,
+    past_window: torch.Tensor,
+    target_node: int,
+    target_channel: int,
+) -> torch.Tensor:
+    """
+    Hold the target node at the last observed value for half the horizon,
+    then step to the adjusted target endpoint and keep it flat.
+    """
+
+    if baseline.shape != adjusted_target.shape:
+        raise ValueError("baseline and adjusted_target must share the same shape for step guidance")
+    horizon = baseline.shape[1]
+    if horizon == 0:
+        return baseline.clone()
+
+    num_nodes = baseline.shape[0]
+    if target_node >= num_nodes or target_node < -1:
+        raise ValueError(f"target_adjust_node {target_node} is out of range for {num_nodes} nodes")
+    if target_channel < 0 or target_channel >= past_window.shape[-1]:
+        raise ValueError(f"target_channel {target_channel} is out of range for past window features {past_window.shape[-1]}")
+
+    guidance = baseline.clone()
+    start_values = past_window[-1, :, target_channel].to(baseline.device, baseline.dtype)
+    midpoint = horizon // 2
+    target_nodes = range(num_nodes) if target_node < 0 else [target_node]
+
+    for node in target_nodes:
+        start_val = start_values[node]
+        end_val = adjusted_target[node, -1].to(baseline.device, baseline.dtype)
+        if midpoint > 0:
+            guidance[node, :midpoint] = start_val
+        guidance[node, midpoint:] = end_val
+
+    return guidance
+
+
+def build_dc_shift_guidance_target(
+    baseline: torch.Tensor,
+    adjusted_target: torch.Tensor,
+    past_window: torch.Tensor,
+    target_node: int,
+    target_channel: int,
+) -> torch.Tensor:
+    """Use a flat guidance line at the adjusted target endpoint."""
+
+    if baseline.shape != adjusted_target.shape:
+        raise ValueError("baseline and adjusted_target must share the same shape for dc_shift guidance")
+    horizon = baseline.shape[1]
+    if horizon == 0:
+        return baseline.clone()
+
+    num_nodes = baseline.shape[0]
+    if target_node >= num_nodes or target_node < -1:
+        raise ValueError(f"target_adjust_node {target_node} is out of range for {num_nodes} nodes")
+    if target_channel < 0 or target_channel >= past_window.shape[-1]:
+        raise ValueError(f"target_channel {target_channel} is out of range for past window features {past_window.shape[-1]}")
+
+    guidance = baseline.clone()
+    target_nodes = range(num_nodes) if target_node < 0 else [target_node]
+    for node in target_nodes:
+        end_val = adjusted_target[node, -1].to(baseline.device, baseline.dtype)
+        guidance[node] = end_val
 
     return guidance
 
@@ -1777,17 +1878,25 @@ def load_forecaster_from_checkpoint(path: Path, device: torch.device, data_root_
 def run_counterfactual_command(args: argparse.Namespace) -> None:
     device = forecaster_module.resolve_device(args.device, args.gpu_ids)
     forecaster_path = Path(args.forecaster_checkpoint)
-    diffusion_path = Path(args.diffusion_checkpoint)
 
     forecaster, bundle, dataset_meta = load_forecaster_from_checkpoint(
         forecaster_path, device, Path(args.data_root) if args.data_root else None
     )
     model_type = dataset_meta.get("model", "stgcn")
 
-    diffusion, diffusion_ckpt = load_diffusion_checkpoint(diffusion_path, device, gpu_ids=args.gpu_ids)
-    dataset_info = diffusion_ckpt.get("dataset_meta", {})
-    if dataset_info.get("dataset") and dataset_info.get("dataset") != dataset_meta["dataset"]:
-        print("Warning: Forecaster and diffusion checkpoints were trained on different datasets.")
+    # Load diffusion model only when using diffusion method
+    diffusion = None
+    diffusion_ckpt = {}
+    diffusion_path = None
+    dataset_info = {}
+    if args.control_method == "diffusion":
+        if args.diffusion_checkpoint is None:
+            raise ValueError("--diffusion_checkpoint is required when --control_method is 'diffusion'")
+        diffusion_path = Path(args.diffusion_checkpoint)
+        diffusion, diffusion_ckpt = load_diffusion_checkpoint(diffusion_path, device, gpu_ids=args.gpu_ids)
+        dataset_info = diffusion_ckpt.get("dataset_meta", {})
+        if dataset_info.get("dataset") and dataset_info.get("dataset") != dataset_meta["dataset"]:
+            print("Warning: Forecaster and diffusion checkpoints were trained on different datasets.")
 
     dataset_horizon = dataset_meta["horizon"]
     cf_horizon = args.cf_horizon if args.cf_horizon is not None else dataset_horizon
@@ -1841,6 +1950,22 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
     else:
         if args.guidance_path_strategy == "linear":
             guidance_target = build_linear_guidance_target(
+                baseline_forecast,
+                adjusted_target,
+                past_window,
+                args.target_adjust_node,
+                target_ch,
+            )
+        elif args.guidance_path_strategy == "step":
+            guidance_target = build_step_guidance_target(
+                baseline_forecast,
+                adjusted_target,
+                past_window,
+                args.target_adjust_node,
+                target_ch,
+            )
+        elif args.guidance_path_strategy == "dc_shift":
+            guidance_target = build_dc_shift_guidance_target(
                 baseline_forecast,
                 adjusted_target,
                 past_window,
@@ -1902,12 +2027,15 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         anchor_end_weight=args.anchor_end_weight,
         anchor_loss_scale=args.anchor_loss_scale,
     )
-    generator = CounterfactualGenerator(
-        diffusion,
-        adjacency=bundle.adjacency.to(device),
-        device=device,
-        temporal_context=build_temporal_context(dataset_meta["lag"], device),
-    )
+    # Create generator only for diffusion method
+    generator = None
+    if args.control_method == "diffusion":
+        generator = CounterfactualGenerator(
+            diffusion,
+            adjacency=bundle.adjacency.to(device),
+            device=device,
+            temporal_context=build_temporal_context(dataset_meta["lag"], device),
+        )
 
     if args.iterative_guidance:
         if not args.short_forecaster_checkpoint:
@@ -1918,7 +2046,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             device,
             Path(args.data_root) if args.data_root else None,
         )
-        short_model_type = short_meta.get("model", "stgcn")
+        short_model_type = short_meta.get("model", "causal_forecaster")
+        print(f"[DEBUG] Short forecaster model_type: {short_model_type}")
         if short_meta.get("horizon", 1) != 1:
             raise ValueError("Short-term forecaster must have horizon=1 for iterative guidance.")
         if short_meta.get("lag") != dataset_meta.get("lag"):
@@ -1955,10 +2084,10 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         edit_mask = edit_mask * base_mask
         edit_mask = edit_mask.to(device)
 
-        # Setup for gradient/jacobian control methods
+        # Setup for gradient/jacobian/perturbation control methods
         controller = None
         control_indices = None
-        if args.control_method in ("gradient", "jacobian"):
+        if args.control_method in ("gradient", "jacobian", "perturbation"):
             # Get control node indices (for TEP: XMV variables)
             control_indices_np = resolve_tep_control_nodes(
                 dataset_meta.get("dataset", ""),
@@ -1991,6 +2120,14 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 method_kwargs = {
                     "regularization": args.jacobian_reg,
                     "max_delta": args.jacobian_max_delta,
+                }
+            elif args.control_method == "perturbation":
+                method_kwargs = {
+                    "n_random_samples": args.perturbation_samples,
+                    "perturbation_scale": args.perturbation_scale,
+                    "n_refine_steps": args.perturbation_refine_steps,
+                    "refine_lr": args.perturbation_refine_lr,
+                    "finite_diff_eps": args.perturbation_eps,
                 }
 
             controller = CausalController(
@@ -2110,7 +2247,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 best_windows.append(best_window.detach().cpu())
 
             else:
-                # Gradient or Jacobian-based control method
+                # Gradient, Jacobian, or Perturbation-based control method
                 # Get target for the specific target nodes
                 if args.target_adjust_node >= 0:
                     y_desired = step_target[args.target_adjust_node : args.target_adjust_node + 1, :]
@@ -2275,6 +2412,63 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             if metrics_plot_path is not None:
                 save_counterfactual_metrics_plot(metrics_plot_path, metrics)
 
+        # Generate CSV tracking table for counterfactual analysis
+        cf_tracking_csv_path = Path(args.output_path).with_name(
+            f"{Path(args.output_path).stem}_cf_tracking.csv"
+        )
+        target_node_idx = args.target_adjust_node if args.target_adjust_node >= 0 else 0
+        control_nodes_to_track = list(range(41, 52))  # Control nodes 41-51 (11 XMV nodes for TEP)
+
+        # Prepare header: Node Name, Timestamp 0, Timestamp 1, ..., Timestamp 19
+        num_timestamps = min(iter_steps, 20)
+        csv_header = ["Node Name"] + [f"Timestamp {t}" for t in range(num_timestamps)]
+
+        # Compute control node changes (perturbation effect)
+        control_changes = edited_last_lag_plot - prev_last_lag_plot
+
+        # Build rows
+        csv_rows = []
+
+        # Row 1: Ground Truth for target node
+        ground_truth_row = ["Ground Truth (Target Node)"]
+        for t in range(num_timestamps):
+            ground_truth_row.append(float(default_target_plot[target_node_idx, t].item()))
+        csv_rows.append(ground_truth_row)
+
+        # Row 2: Target Trajectory values
+        target_traj_row = ["Target Trajectory"]
+        target_data = guidance_target_plot if guidance_target_plot is not None else adjusted_target_plot
+        for t in range(num_timestamps):
+            target_traj_row.append(float(target_data[target_node_idx, t].item()))
+        csv_rows.append(target_traj_row)
+
+        # Row 3: Forecaster Output for target node
+        forecaster_output_row = ["Forecaster Output (Target Node)"]
+        for t in range(num_timestamps):
+            forecaster_output_row.append(float(iterative_plot[target_node_idx, t].item()))
+        csv_rows.append(forecaster_output_row)
+
+        # Rows 4-6: Control node perturbation changes
+        for ctrl_node in control_nodes_to_track:
+            if ctrl_node < control_changes.shape[0]:
+                ctrl_change_row = [f"Control Node {ctrl_node} Change"]
+                for t in range(num_timestamps):
+                    ctrl_change_row.append(float(control_changes[ctrl_node, t].item()))
+                csv_rows.append(ctrl_change_row)
+            else:
+                # Node index out of range, add placeholder row
+                ctrl_change_row = [f"Control Node {ctrl_node} Change (N/A)"]
+                ctrl_change_row.extend([0.0] * num_timestamps)
+                csv_rows.append(ctrl_change_row)
+
+        # Write CSV file
+        cf_tracking_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cf_tracking_csv_path, "w", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(csv_header)
+            writer.writerows(csv_rows)
+        print(f"Saved counterfactual tracking CSV to {cf_tracking_csv_path}")
+
         output = {
             "mode": "iterative",
             "samples": None,
@@ -2284,7 +2478,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             "metadata": {
                 "forecaster_checkpoint": str(forecaster_path),
                 "short_forecaster_checkpoint": str(short_forecaster_path),
-                "diffusion_checkpoint": str(diffusion_path),
+                "diffusion_checkpoint": str(diffusion_path) if diffusion_path else None,
+                "control_method": args.control_method,
                 "dataset": dataset_meta,
                 "diffusion_dataset": dataset_info,
                 "split": args.split,
@@ -2315,6 +2510,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             "metrics_plot_path": str(metrics_plot_path) if metrics_plot_path else None,
             "control_node_action_dir": str(control_action_dir) if control_action_paths else None,
             "control_node_action_paths": [str(path) for path in control_action_paths] if control_action_paths else None,
+            "cf_tracking_csv_path": str(cf_tracking_csv_path),
             "metrics_input": args.metrics_input,
             "metrics_eps": args.metrics_eps,
             "mask_target_history": args.mask_target_history,
@@ -2347,6 +2543,13 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         torch.save(output, output_path)
         print(f"Saved iterative counterfactual samples to {output_path}")
         return
+
+    # Non-iterative path only supports diffusion method
+    if args.control_method != "diffusion":
+        raise ValueError(
+            f"--control_method '{args.control_method}' requires --iterative_guidance. "
+            "Non-iterative counterfactual generation only supports --control_method diffusion."
+        )
 
     mask = base_mask.to(device)
     target_batched = guidance_target.unsqueeze(0).repeat(args.samples, 1, 1).to(device)
@@ -2451,7 +2654,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         "guidance": asdict(guidance_config),
         "metadata": {
             "forecaster_checkpoint": str(forecaster_path),
-            "diffusion_checkpoint": str(diffusion_path),
+            "diffusion_checkpoint": str(diffusion_path) if diffusion_path else None,
+            "control_method": args.control_method,
             "dataset": dataset_meta,
             "diffusion_dataset": dataset_info,
             "split": args.split,

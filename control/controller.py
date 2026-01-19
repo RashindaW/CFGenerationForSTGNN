@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from .gradient_optimizer import GradientBasedController, GradientOptimizerConfig
 from .jacobian_controller import JacobianController, JacobianConfig
+from .perturbation_controller import PerturbationController, PerturbationConfig
 
 
 class CausalController:
@@ -88,8 +89,28 @@ class CausalController:
                 lag_weights=lag_weights,
                 neighbor_only_inputs=neighbor_only_inputs,
             )
+        elif method == "perturbation":
+            config = PerturbationConfig(
+                n_random_samples=method_kwargs.get("n_random_samples", 200),
+                perturbation_scale=method_kwargs.get("perturbation_scale", 0.1),
+                n_refine_steps=method_kwargs.get("n_refine_steps", 50),
+                refine_lr=method_kwargs.get("refine_lr", 0.01),
+                finite_diff_eps=method_kwargs.get("finite_diff_eps", 1e-4),
+                convergence_tol=method_kwargs.get("convergence_tol", 1e-6),
+            )
+            self._controller = PerturbationController(
+                forecaster=forecaster,
+                control_indices=control_indices,
+                target_indices=target_indices,
+                adjacency=adjacency,
+                config=config,
+                x_bounds=x_bounds,
+                model_type=model_type,
+                lag_weights=lag_weights,
+                neighbor_only_inputs=neighbor_only_inputs,
+            )
         else:
-            raise ValueError(f"Unknown control method: {method}. Use 'gradient' or 'jacobian'.")
+            raise ValueError(f"Unknown control method: {method}. Use 'gradient', 'jacobian', or 'perturbation'.")
 
     def control(
         self,
@@ -135,6 +156,18 @@ class CausalController:
                     "jacobian": jacobian,
                     "sensitivities": sensitivities,
                     "method": "jacobian",
+                },
+            }
+        elif self.method == "perturbation":
+            x_optimal, y_predicted, loss_history = self._controller.find_intervention(
+                current_window, y_desired, target_channel
+            )
+            return {
+                "x_optimal": x_optimal,
+                "y_predicted": y_predicted,
+                "method_metadata": {
+                    "loss_history": loss_history,
+                    "method": "perturbation",
                 },
             }
         else:

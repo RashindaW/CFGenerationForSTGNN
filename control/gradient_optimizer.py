@@ -81,7 +81,8 @@ class GradientBasedController:
         self.neighbor_only_inputs = neighbor_only_inputs
 
         self.device = next(forecaster.parameters()).device
-        self.forecaster.eval()
+        # Note: We keep the model in its current mode. For RNNs with cuDNN,
+        # backward passes require training mode, so we'll handle this in find_intervention.
 
     def find_intervention(
         self,
@@ -107,71 +108,111 @@ class GradientBasedController:
         if y_desired.dim() == 1:
             y_desired = y_desired.unsqueeze(-1)
 
-        # Extract baseline control values (last timestep)
-        x_baseline = current_window[-1, self.control_indices, :].clone()
+        # Save original training mode and set to train for backward pass (required for cuDNN RNNs)
+        was_training = self.forecaster.training
+        self.forecaster.train()
 
-        # Initialize learnable control values
-        x_opt = x_baseline.clone().requires_grad_(True)
+        # Freeze model parameters - we only want to optimize x_opt
+        original_requires_grad = {}
+        for name, param in self.forecaster.named_parameters():
+            original_requires_grad[name] = param.requires_grad
+            param.requires_grad = False
 
-        # Setup optimizer
-        if self.config.optimizer_type == "adam":
-            optimizer = torch.optim.Adam([x_opt], lr=self.config.lr)
-        elif self.config.optimizer_type == "lbfgs":
-            optimizer = torch.optim.LBFGS(
-                [x_opt], lr=self.config.lr, max_iter=20, line_search_fn="strong_wolfe"
-            )
-        else:
-            raise ValueError(f"Unknown optimizer type: {self.config.optimizer_type}")
+        try:
+            # Extract baseline control values (last timestep)
+            x_baseline = current_window[-1, self.control_indices, :].clone()
 
-        loss_history = []
-        prev_loss = float("inf")
+            # Initialize learnable control values
+            x_opt = x_baseline.clone().requires_grad_(True)
 
-        for step in range(self.config.n_steps):
-            if self.config.optimizer_type == "lbfgs":
+            # Setup optimizer
+            if self.config.optimizer_type == "adam":
+                optimizer = torch.optim.Adam([x_opt], lr=self.config.lr)
+            elif self.config.optimizer_type == "lbfgs":
+                optimizer = torch.optim.LBFGS(
+                    [x_opt], lr=self.config.lr, max_iter=20, line_search_fn="strong_wolfe"
+                )
+            else:
+                raise ValueError(f"Unknown optimizer type: {self.config.optimizer_type}")
 
-                def closure():
+            loss_history = []
+            prev_loss = float("inf")
+
+            # Debug: print initial state
+            with torch.no_grad():
+                init_loss, init_pred = self._compute_loss(
+                    current_window, x_opt, y_desired, x_baseline, target_channel
+                )
+                print(f"[GradientController] Initial - target: {y_desired.flatten()[:3].tolist()}, "
+                      f"pred: {init_pred.flatten()[:3].tolist()}, loss: {init_loss.item():.6f}")
+                print(f"[GradientController] Control baseline (first 3): {x_baseline[:3, 0].tolist()}")
+
+            for step in range(self.config.n_steps):
+                if self.config.optimizer_type == "lbfgs":
+
+                    def closure():
+                        optimizer.zero_grad()
+                        loss, _ = self._compute_loss(
+                            current_window, x_opt, y_desired, x_baseline, target_channel
+                        )
+                        loss.backward()
+                        if self.config.grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_([x_opt], self.config.grad_clip)
+                        return loss
+
+                    loss = optimizer.step(closure)
+                    loss_val = loss.item()
+                else:
                     optimizer.zero_grad()
                     loss, _ = self._compute_loss(
                         current_window, x_opt, y_desired, x_baseline, target_channel
                     )
                     loss.backward()
+
+                    # Debug: print gradient info on first step
+                    if step == 0:
+                        if x_opt.grad is not None:
+                            grad_mag = x_opt.grad.abs().mean().item()
+                            grad_max = x_opt.grad.abs().max().item()
+                            print(f"[GradientController] Step 0 gradient - mean: {grad_mag:.10f}, max: {grad_max:.10f}")
+                        else:
+                            print("[GradientController] WARNING: x_opt.grad is None!")
+
                     if self.config.grad_clip > 0:
                         torch.nn.utils.clip_grad_norm_([x_opt], self.config.grad_clip)
-                    return loss
 
-                loss = optimizer.step(closure)
-                loss_val = loss.item()
-            else:
-                optimizer.zero_grad()
-                loss, _ = self._compute_loss(
+                    optimizer.step()
+                    loss_val = loss.item()
+
+                # Project onto constraints
+                with torch.no_grad():
+                    x_opt.data = self._project_constraints(x_opt.data)
+
+                loss_history.append(loss_val)
+
+                # Check convergence
+                if abs(prev_loss - loss_val) < self.config.convergence_tol:
+                    break
+                prev_loss = loss_val
+
+            # Get final prediction
+            with torch.no_grad():
+                final_loss, y_pred = self._compute_loss(
                     current_window, x_opt, y_desired, x_baseline, target_channel
                 )
-                loss.backward()
+                control_change = (x_opt - x_baseline).abs().mean().item()
+                print(f"[GradientController] Final - pred: {y_pred.flatten()[:3].tolist()}, "
+                      f"loss: {final_loss.item():.6f}, mean |delta_control|: {control_change:.6f}")
+                print(f"[GradientController] Converged in {len(loss_history)} steps")
 
-                if self.config.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_([x_opt], self.config.grad_clip)
+            return x_opt.detach(), y_pred.detach(), loss_history
 
-                optimizer.step()
-                loss_val = loss.item()
-
-            # Project onto constraints
-            with torch.no_grad():
-                x_opt.data = self._project_constraints(x_opt.data)
-
-            loss_history.append(loss_val)
-
-            # Check convergence
-            if abs(prev_loss - loss_val) < self.config.convergence_tol:
-                break
-            prev_loss = loss_val
-
-        # Get final prediction
-        with torch.no_grad():
-            _, y_pred = self._compute_loss(
-                current_window, x_opt, y_desired, x_baseline, target_channel
-            )
-
-        return x_opt.detach(), y_pred.detach(), loss_history
+        finally:
+            # Restore original model state
+            for name, param in self.forecaster.named_parameters():
+                param.requires_grad = original_requires_grad[name]
+            if not was_training:
+                self.forecaster.eval()
 
     def _compute_loss(
         self,
@@ -188,8 +229,31 @@ class GradientBasedController:
             y_pred: Predicted target values.
         """
         # Create modified window with optimized control values
-        window_modified = current_window.clone()
-        window_modified[-1, self.control_indices, :] = x_control
+        # Use differentiable operations to maintain gradient flow
+        lag_len, num_nodes, num_features = current_window.shape
+
+        # Keep all timesteps except last unchanged
+        window_except_last = current_window[:-1]  # (lag-1, nodes, features)
+
+        # For the last timestep, we need to replace control node values with x_control
+        # using differentiable operations (no in-place indexing)
+        last_original = current_window[-1]  # (num_nodes, features)
+
+        # Create a float mask: 1.0 for control nodes, 0.0 for others
+        mask = torch.zeros(num_nodes, 1, device=current_window.device, dtype=current_window.dtype)
+        mask[self.control_indices] = 1.0
+
+        # Expand x_control to full node size using scatter (differentiable)
+        indices = self.control_indices.unsqueeze(-1).expand(-1, num_features)  # (num_control, features)
+        x_control_full = torch.zeros(num_nodes, num_features, device=current_window.device, dtype=current_window.dtype)
+        x_control_full = x_control_full.scatter(0, indices, x_control)
+
+        # Combine: control nodes get x_control, others get original values
+        # last_new = mask * x_control_full + (1 - mask) * last_original
+        last_timestep_new = mask * x_control_full + (1.0 - mask) * last_original
+
+        # Concatenate to form full window
+        window_modified = torch.cat([window_except_last, last_timestep_new.unsqueeze(0)], dim=0)
 
         # Forward pass through forecaster
         # Input shape: (1, lag, nodes, features) -> prepare -> (1, features, nodes, lag)

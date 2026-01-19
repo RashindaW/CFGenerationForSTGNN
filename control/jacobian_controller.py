@@ -72,7 +72,8 @@ class JacobianController:
         self.neighbor_only_inputs = neighbor_only_inputs
 
         self.device = next(forecaster.parameters()).device
-        self.forecaster.eval()
+        # Note: We keep the model in its current mode. For RNNs with cuDNN,
+        # backward passes require training mode, so we'll handle this in compute_jacobian.
 
     def compute_jacobian(
         self,
@@ -94,47 +95,65 @@ class JacobianController:
         num_features = current_window.shape[-1]
         num_target = len(self.target_indices)
 
-        # Create a copy of the window with requires_grad on control nodes at last timestep
-        window = current_window.clone()
+        # Save original training mode and set to train for backward pass (required for cuDNN RNNs)
+        was_training = self.forecaster.training
+        self.forecaster.train()
 
-        # Extract control values as learnable parameters
-        x_control = window[-1, self.control_indices, :].clone().requires_grad_(True)
+        # Freeze model parameters - we only want gradients w.r.t. x_control
+        original_requires_grad = {}
+        for name, param in self.forecaster.named_parameters():
+            original_requires_grad[name] = param.requires_grad
+            param.requires_grad = False
 
-        # Substitute back into window
-        window_modified = window.clone()
-        window_modified[-1, self.control_indices, :] = x_control
+        try:
+            # Create a copy of the window with requires_grad on control nodes at last timestep
+            window = current_window.clone()
 
-        # Forward pass
-        forecaster_input = prepare_forecaster_input(window_modified.unsqueeze(0))
+            # Extract control values as learnable parameters
+            x_control = window[-1, self.control_indices, :].clone().requires_grad_(True)
 
-        y_pred_full = forward_pass(
-            self.forecaster,
-            forecaster_input,
-            self.model_type,
-            lag_weights=self.lag_weights,
-            adjacency=self.adjacency,
-            neighbor_only_inputs=self.neighbor_only_inputs,
-        )
+            # Substitute back into window
+            window_modified = window.clone()
+            window_modified[-1, self.control_indices, :] = x_control
 
-        # Extract target predictions: (1, nodes, horizon) -> (num_target,)
-        y_pred = y_pred_full[0, self.target_indices, 0]  # horizon=1
+            # Forward pass
+            forecaster_input = prepare_forecaster_input(window_modified.unsqueeze(0))
 
-        # Compute Jacobian row by row using backward passes
-        jacobian_rows = []
-        for i in range(num_target):
-            if x_control.grad is not None:
-                x_control.grad.zero_()
+            y_pred_full = forward_pass(
+                self.forecaster,
+                forecaster_input,
+                self.model_type,
+                lag_weights=self.lag_weights,
+                adjacency=self.adjacency,
+                neighbor_only_inputs=self.neighbor_only_inputs,
+            )
 
-            # Backprop from single target output
-            y_pred[i].backward(retain_graph=True)
+            # Extract target predictions: (1, nodes, horizon) -> (num_target,)
+            y_pred = y_pred_full[0, self.target_indices, 0]  # horizon=1
 
-            # Get gradient w.r.t. control inputs
-            grad = x_control.grad.clone()  # (num_control, features)
-            jacobian_rows.append(grad.view(-1))  # Flatten to (num_control * features,)
+            # Compute Jacobian row by row using backward passes
+            jacobian_rows = []
+            for i in range(num_target):
+                if x_control.grad is not None:
+                    x_control.grad.zero_()
 
-        jacobian = torch.stack(jacobian_rows, dim=0)  # (num_target, num_control * features)
+                # Backprop from single target output
+                y_pred[i].backward(retain_graph=True)
 
-        return jacobian
+                # Get gradient w.r.t. control inputs
+                grad = x_control.grad.clone()  # (num_control, features)
+                jacobian_rows.append(grad.view(-1))  # Flatten to (num_control * features,)
+
+            jacobian = torch.stack(jacobian_rows, dim=0)  # (num_target, num_control * features)
+
+            return jacobian
+
+        finally:
+            # Restore original model state
+            for name, param in self.forecaster.named_parameters():
+                param.requires_grad = original_requires_grad[name]
+            if not was_training:
+                self.forecaster.eval()
 
     def find_intervention(
         self,
