@@ -18,6 +18,36 @@ def prepare_forecaster_input(x: torch.Tensor) -> torch.Tensor:
     return x.permute(0, 3, 2, 1).contiguous()
 
 
+def _convert_global_to_local_indices(
+    global_indices: torch.Tensor,
+    manipulated_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Convert global node indices to local indices within manipulated nodes.
+
+    For causal_forecaster, the model only outputs predictions for manipulated nodes.
+    This function finds the position of each global target index within the
+    manipulated_indices list.
+
+    Args:
+        global_indices: Global node indices to convert.
+        manipulated_indices: Global indices of manipulated nodes.
+
+    Returns:
+        Local indices corresponding to positions in manipulated_indices.
+    """
+    manip_list = manipulated_indices.tolist()
+    local_indices = []
+    for gi in global_indices.tolist():
+        if gi in manip_list:
+            local_indices.append(manip_list.index(gi))
+        else:
+            raise ValueError(
+                f"Target index {gi} is not in manipulated_indices. "
+                "Cannot use non-manipulated nodes as targets for causal_forecaster."
+            )
+    return torch.tensor(local_indices, device=global_indices.device, dtype=torch.long)
+
+
 @dataclass
 class PerturbationConfig:
     """Configuration for perturbation-based optimization."""
@@ -55,19 +85,23 @@ class PerturbationController:
         model_type: str = "stgcn",
         lag_weights: Optional[torch.Tensor] = None,
         neighbor_only_inputs: bool = False,
+        manipulated_indices: Optional[torch.Tensor] = None,
     ):
         """Initialize the perturbation-based controller.
 
         Args:
             forecaster: Trained forecaster model (horizon=1).
             control_indices: Indices of control nodes in the graph.
-            target_indices: Indices of target nodes to match.
+            target_indices: Indices of target nodes to match (global indices).
             adjacency: Graph adjacency matrix.
             config: Optimization configuration.
             x_bounds: (min, max) bounds for control values (optional global bounds).
             model_type: Type of forecaster model.
             lag_weights: Optional weights for lag dimensions.
             neighbor_only_inputs: Whether to use neighbor-only inputs.
+            manipulated_indices: Global indices of manipulated nodes. Required
+                for causal_forecaster model type to convert between global and
+                local indices.
         """
         self.forecaster = forecaster
         self.control_indices = control_indices
@@ -78,8 +112,26 @@ class PerturbationController:
         self.model_type = model_type
         self.lag_weights = lag_weights
         self.neighbor_only_inputs = neighbor_only_inputs
+        self.manipulated_indices = manipulated_indices
 
         self.device = next(forecaster.parameters()).device
+
+        # For causal_forecaster, compute local target indices
+        self._is_causal_forecaster = model_type == "causal_forecaster"
+        if self._is_causal_forecaster:
+            if manipulated_indices is None:
+                # Try to get from model
+                if hasattr(forecaster, "manipulated_indices"):
+                    self.manipulated_indices = forecaster.manipulated_indices
+                else:
+                    raise ValueError(
+                        "manipulated_indices must be provided for causal_forecaster model type"
+                    )
+            self._local_target_indices = _convert_global_to_local_indices(
+                target_indices, self.manipulated_indices
+            )
+        else:
+            self._local_target_indices = None
 
     def find_intervention(
         self,
@@ -440,7 +492,7 @@ class PerturbationController:
 
         Returns:
             loss: MSE loss between predicted and desired target values.
-            y_pred: Predicted target values.
+            y_pred: Predicted target values (local indices for causal_forecaster).
         """
         # Apply perturbation to control nodes
         x_perturbed = x_baseline + perturbation
@@ -455,18 +507,24 @@ class PerturbationController:
         # Forward pass through forecaster
         forecaster_input = prepare_forecaster_input(window_modified.unsqueeze(0))
 
-        y_pred_full = forward_pass(
-            self.forecaster,
-            forecaster_input,
-            self.model_type,
-            lag_weights=self.lag_weights,
-            adjacency=self.adjacency,
-            neighbor_only_inputs=self.neighbor_only_inputs,
-        )
-
-        # Extract target node predictions
-        # y_pred_full shape: (1, nodes, horizon) where horizon=1
-        y_pred = y_pred_full[0, self.target_indices, :]  # (num_target, 1)
+        if self._is_causal_forecaster:
+            # For causal_forecaster, use forward_manipulated_only to get (B, 41, H)
+            y_pred_full = self.forecaster.forward_manipulated_only(forecaster_input)
+            # Shape: (1, num_manip, 1)
+            # Extract target predictions using local indices
+            y_pred = y_pred_full[0, self._local_target_indices, :]  # (num_target, 1)
+        else:
+            y_pred_full = forward_pass(
+                self.forecaster,
+                forecaster_input,
+                self.model_type,
+                lag_weights=self.lag_weights,
+                adjacency=self.adjacency,
+                neighbor_only_inputs=self.neighbor_only_inputs,
+            )
+            # Shape: (1, num_nodes, horizon) where horizon=1
+            # Extract target node predictions using global indices
+            y_pred = y_pred_full[0, self.target_indices, :]  # (num_target, 1)
 
         # Compute MSE loss
         loss = torch.mean((y_pred - y_desired) ** 2)

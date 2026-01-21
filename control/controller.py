@@ -98,6 +98,10 @@ class CausalController:
                 finite_diff_eps=method_kwargs.get("finite_diff_eps", 1e-4),
                 convergence_tol=method_kwargs.get("convergence_tol", 1e-6),
             )
+            # For causal_forecaster, get manipulated_indices from the model
+            manipulated_indices = None
+            if model_type == "causal_forecaster" and hasattr(forecaster, "manipulated_indices"):
+                manipulated_indices = forecaster.manipulated_indices
             self._controller = PerturbationController(
                 forecaster=forecaster,
                 control_indices=control_indices,
@@ -108,6 +112,7 @@ class CausalController:
                 model_type=model_type,
                 lag_weights=lag_weights,
                 neighbor_only_inputs=neighbor_only_inputs,
+                manipulated_indices=manipulated_indices,
             )
         else:
             raise ValueError(f"Unknown control method: {method}. Use 'gradient', 'jacobian', or 'perturbation'.")

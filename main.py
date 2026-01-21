@@ -63,6 +63,17 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        choices=["none", "step", "cosine", "plateau"],
+        default="none",
+        help="Learning rate scheduler type.",
+    )
+    parser.add_argument("--scheduler_step_size", type=int, default=10, help="Step size for StepLR scheduler.")
+    parser.add_argument("--scheduler_gamma", type=float, default=0.1, help="Decay factor for StepLR/ReduceLROnPlateau.")
+    parser.add_argument("--scheduler_patience", type=int, default=5, help="Patience for ReduceLROnPlateau scheduler.")
+    parser.add_argument("--scheduler_min_lr", type=float, default=1e-6, help="Minimum learning rate for schedulers.")
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--hidden_channels", type=int, default=32)
     parser.add_argument("--num_layers", type=int, default=2)
@@ -105,6 +116,14 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
         help="Comma-separated global node indices used as target nodes (subset of manipulated).",
     )
     parser.add_argument("--tcn_dilation_base", type=int, default=2, help="TCN dilation base for causal_forecaster.")
+    parser.add_argument(
+        "--control_last_weight",
+        type=float,
+        default=None,
+        help="Percent (0-100) of weight for last lag timestep of control nodes. "
+             "Remaining weight is distributed equally among earlier timesteps. "
+             "Only applies to causal_forecaster model.",
+    )
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--device", type=str, default=None)
@@ -2160,19 +2179,33 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 step_input = prepare_forecaster_input(current_window.unsqueeze(0))
                 if args.mask_target_history and args.target_adjust_node >= 0:
                     step_input = mask_target_history_input(step_input, args.target_adjust_node, target_ch, mask_value)
-                step_pred = forecaster_module.forward_pass(
-                    short_forecaster,
-                    step_input,
-                    short_model_type,
-                    lag_weights=short_meta.get("lag_weights"),
-                    adjacency=short_bundle.adjacency,
-                    neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
-                )
-                if step_pred.dim() == 2:
-                    step_pred = step_pred.unsqueeze(-1)
-                step_pred = step_pred[:, :, :1]
-            step_pred = step_pred.squeeze(0)
-            iterative_actions[:, step] = step_pred.squeeze(-1)
+
+                if short_model_type == "causal_forecaster" and hasattr(short_forecaster, "forward_manipulated_only"):
+                    # For causal_forecaster, use forward_manipulated_only to get (B, num_manip, H)
+                    step_pred_manip = short_forecaster.forward_manipulated_only(step_input)
+                    step_pred_manip = step_pred_manip[:, :, :1].squeeze(0)  # (num_manip, 1)
+
+                    # Map back to full tensor
+                    model_manip_indices = short_forecaster.manipulated_indices
+                    step_pred = torch.zeros((bundle.num_nodes, 1), device=device)
+                    step_pred[model_manip_indices, :] = step_pred_manip
+
+                    # Store actions for manipulated nodes only
+                    iterative_actions[model_manip_indices, step] = step_pred_manip.squeeze(-1)
+                else:
+                    step_pred = forecaster_module.forward_pass(
+                        short_forecaster,
+                        step_input,
+                        short_model_type,
+                        lag_weights=short_meta.get("lag_weights"),
+                        adjacency=short_bundle.adjacency,
+                        neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
+                    )
+                    if step_pred.dim() == 2:
+                        step_pred = step_pred.unsqueeze(-1)
+                    step_pred = step_pred[:, :, :1]
+                    step_pred = step_pred.squeeze(0)
+                    iterative_actions[:, step] = step_pred.squeeze(-1)
 
             step_target = target_series[:, step : step + 1]
             iterative_targets[:, step] = step_target.squeeze(-1)
@@ -2272,25 +2305,61 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                     cf_input = prepare_forecaster_input(best_window.unsqueeze(0))
                     if args.mask_target_history and args.target_adjust_node >= 0:
                         cf_input = mask_target_history_input(cf_input, args.target_adjust_node, target_ch, mask_value)
-                    cf_pred = forecaster_module.forward_pass(
-                        short_forecaster,
-                        cf_input,
-                        short_model_type,
-                        lag_weights=short_meta.get("lag_weights"),
-                        adjacency=short_bundle.adjacency,
-                        neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
-                    )
-                    if cf_pred.dim() == 2:
-                        cf_pred = cf_pred.unsqueeze(-1)
-                    cf_pred = cf_pred[:, :, :1]
 
-                best_pred = cf_pred.squeeze(0)
-                iterative_predictions[:, step] = best_pred.squeeze(-1)
+                    if short_model_type == "causal_forecaster" and hasattr(short_forecaster, "forward_manipulated_only"):
+                        # For causal_forecaster, use forward_manipulated_only to get (B, num_manip, H)
+                        cf_pred_manip = short_forecaster.forward_manipulated_only(cf_input)
+                        # Shape: (1, num_manip, 1) -> squeeze to (num_manip, 1)
+                        cf_pred_manip = cf_pred_manip[:, :, :1].squeeze(0)  # (num_manip, 1)
 
-                # Compute MSE for this step
-                diff_sq = (best_pred - step_target) ** 2
-                per_node = diff_sq.mean(dim=1)
-                mse_step = (per_node * node_w).sum()
+                        # Get manipulated_indices from the model to map back to global indices
+                        model_manip_indices = short_forecaster.manipulated_indices
+
+                        # Create full prediction tensor and fill in manipulated predictions
+                        best_pred = torch.zeros((bundle.num_nodes, 1), device=device)
+                        best_pred[model_manip_indices, :] = cf_pred_manip
+
+                        # Store predictions (only manipulated nodes have valid values)
+                        iterative_predictions[model_manip_indices, step] = cf_pred_manip.squeeze(-1)
+
+                        # For MSE, compare only at target nodes
+                        if args.target_adjust_node >= 0:
+                            # Find local index of target in manipulated list
+                            target_local_idx = (model_manip_indices == args.target_adjust_node).nonzero(as_tuple=True)[0]
+                            if len(target_local_idx) > 0:
+                                pred_at_target = cf_pred_manip[target_local_idx[0], :]
+                                target_at_step = step_target[args.target_adjust_node, :]
+                                mse_step = ((pred_at_target - target_at_step) ** 2).mean()
+                            else:
+                                mse_step = torch.tensor(float("inf"), device=device)
+                        else:
+                            # All manipulated nodes
+                            target_manip = step_target[model_manip_indices, :]
+                            diff_sq = (cf_pred_manip - target_manip) ** 2
+                            per_node = diff_sq.mean(dim=1)
+                            node_w_manip = node_w[model_manip_indices]
+                            mse_step = (per_node * node_w_manip).sum()
+                    else:
+                        # Standard models return full predictions
+                        cf_pred = forecaster_module.forward_pass(
+                            short_forecaster,
+                            cf_input,
+                            short_model_type,
+                            lag_weights=short_meta.get("lag_weights"),
+                            adjacency=short_bundle.adjacency,
+                            neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
+                        )
+                        if cf_pred.dim() == 2:
+                            cf_pred = cf_pred.unsqueeze(-1)
+                        cf_pred = cf_pred[:, :, :1]
+                        best_pred = cf_pred.squeeze(0)
+                        iterative_predictions[:, step] = best_pred.squeeze(-1)
+
+                        # Compute MSE for this step
+                        diff_sq = (best_pred - step_target) ** 2
+                        per_node = diff_sq.mean(dim=1)
+                        mse_step = (per_node * node_w).sum()
+
                 mse_per_step.append(float(mse_step.item()))
                 best_indices.append(0)  # No sample selection for controller methods
 
@@ -2301,7 +2370,21 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             # Update window for next iteration
             next_step = best_window[-1].clone()
             if 0 <= target_ch < next_step.shape[-1]:
-                next_step[:, target_ch] = best_pred.squeeze(-1)
+                # Get manipulated indices - either from model or compute from control indices
+                if short_model_type == "causal_forecaster" and hasattr(short_forecaster, "manipulated_indices"):
+                    manip_global_indices = short_forecaster.manipulated_indices
+                else:
+                    # Create mask for manipulated nodes (all nodes except control)
+                    all_indices = set(range(next_step.shape[0]))
+                    control_set = set(control_indices.cpu().tolist()) if control_indices is not None else set()
+                    manip_global_indices = torch.tensor(sorted(all_indices - control_set), device=device, dtype=torch.long)
+
+                # MANIPULATED nodes: insert F_CF prediction
+                # best_pred has shape (num_nodes, 1) with valid values at manipulated indices
+                if len(manip_global_indices) > 0:
+                    next_step[manip_global_indices, target_ch] = best_pred[manip_global_indices].squeeze(-1)
+                # Control nodes: their optimized values are already in best_window[-1]
+                # and will be duplicated into the next position naturally
             current_window = torch.cat([best_window[1:], next_step.unsqueeze(0)], dim=0)
 
         iterative_predictions_cpu = iterative_predictions.detach().cpu()

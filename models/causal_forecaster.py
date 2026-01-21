@@ -349,6 +349,7 @@ class CausalForecasterConfig:
     decoder_dropout: float = 0.1
     activation: str = "relu"
     target_channel: int = 0
+    control_last_weight: Optional[float] = None  # Percentage (0-100) of weight for last lag timestep of control nodes
 
 
 class CausalDualStreamForecaster(nn.Module):
@@ -377,6 +378,13 @@ class CausalDualStreamForecaster(nn.Module):
         self.register_buffer("adj_cm", adj_cm)
         self.register_buffer("adj_mm", adj_mm)
         self.register_buffer("adj_mm_norm", normalize_adjacency(adj_mm, mode=config.spatial_norm, add_self_loops=True))
+
+        # Build control lag weights if specified
+        control_lag_weights = self._build_control_lag_weights(config.lag, config.control_last_weight, device)
+        if control_lag_weights is not None:
+            self.register_buffer("control_lag_weights", control_lag_weights)
+        else:
+            self.control_lag_weights = None
 
         self.control_encoder = build_temporal_encoder(
             name=config.temporal_encoder,
@@ -425,11 +433,46 @@ class CausalDualStreamForecaster(nn.Module):
 
         self.loss_node_indices = self.manipulated_indices
 
+    @staticmethod
+    def _build_control_lag_weights(
+        lag: int, control_last_weight: Optional[float], device: torch.device
+    ) -> Optional[torch.Tensor]:
+        """Build lag weights for control nodes.
+
+        Args:
+            lag: Number of lag timesteps.
+            control_last_weight: Percentage (0-100) of weight assigned to the last lag timestep.
+                Remaining weight is distributed equally among earlier timesteps.
+            device: Device to create tensor on.
+
+        Returns:
+            Tensor of shape (lag,) with weights, or None if control_last_weight is None.
+        """
+        if control_last_weight is None:
+            return None
+        if control_last_weight < 0.0 or control_last_weight > 100.0:
+            raise ValueError("control_last_weight must be between 0 and 100.")
+        if lag <= 1:
+            return torch.ones(1, dtype=torch.float32, device=device)
+
+        last_share = control_last_weight / 100.0
+        other_share = (1.0 - last_share) / (lag - 1)
+        weights = torch.full((lag,), other_share, dtype=torch.float32, device=device)
+        weights[-1] = last_share
+        return weights
+
     def forward_components(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         # x: (batch, features, nodes, lag)
-        x = x.permute(0, 3, 2, 1).contiguous()
-        x_control = x.index_select(2, self.control_indices)
+        x = x.permute(0, 3, 2, 1).contiguous()  # (batch, lag, nodes, features)
+        x_control = x.index_select(2, self.control_indices)  # (batch, lag, num_control, features)
         x_manip = x.index_select(2, self.manipulated_indices)
+
+        # Apply control lag weights if specified
+        # Weights shape: (lag,) -> broadcast to (1, lag, 1, 1)
+        if self.control_lag_weights is not None:
+            weights = self.control_lag_weights.view(1, -1, 1, 1)
+            x_control = x_control * weights
+
         h_control = self.control_encoder(x_control)
         h_manip = self.manip_encoder(x_manip)
         h_manip = self.spatial_gnn(h_manip, self.adj_mm_norm)
@@ -441,12 +484,59 @@ class CausalDualStreamForecaster(nn.Module):
             y_pred = m_pred
         return {"M_pred": m_pred, "Y_pred": y_pred, "X_control": x_control, "X_manip": x_manip}
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_manipulated_only(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass returning only manipulated node predictions.
+
+        Args:
+            x: Input tensor of shape (batch, features, nodes, lag).
+
+        Returns:
+            Predictions for manipulated nodes only, shape (batch, num_manip, horizon).
+        """
         parts = self.forward_components(x)
-        m_pred = parts["M_pred"]
+        m_delta = parts["M_pred"]  # (batch, num_manip, horizon)
+
+        # Get last input value for manipulated nodes
+        manip_channel = min(self.target_channel, parts["X_manip"].size(-1) - 1)
+        last_manip = parts["X_manip"][:, -1, :, manip_channel]  # (batch, num_manip)
+
+        # Residual prediction: last_value + learned_delta
+        m_pred = last_manip.unsqueeze(-1) + m_delta  # (batch, num_manip, horizon)
+
+        return m_pred
+
+    def forward(self, x: torch.Tensor, manipulated_only: bool = False) -> torch.Tensor:
+        """Forward pass through the model.
+
+        Args:
+            x: Input tensor of shape (batch, features, nodes, lag).
+            manipulated_only: If True, return only manipulated node predictions
+                with shape (batch, num_manip, horizon). If False, return full
+                predictions with shape (batch, num_nodes, horizon).
+
+        Returns:
+            Predictions tensor.
+        """
+        if manipulated_only:
+            return self.forward_manipulated_only(x)
+
+        parts = self.forward_components(x)
+        m_delta = parts["M_pred"]  # Now represents delta/change from last input
+
+        # Get last input value for manipulated nodes
+        # X_manip shape: (batch, lag, num_manip, features)
+        manip_channel = min(self.target_channel, parts["X_manip"].size(-1) - 1)
+        last_manip = parts["X_manip"][:, -1, :, manip_channel]  # (batch, num_manip)
+
+        # Residual prediction: last_value + learned_delta
+        m_pred = last_manip.unsqueeze(-1) + m_delta  # (batch, num_manip, horizon)
+
+        # Control nodes: use last known value (unchanged)
         control_channel = min(self.target_channel, parts["X_control"].size(-1) - 1)
         control_last = parts["X_control"][:, -1, :, control_channel]
         control_pred = control_last.unsqueeze(-1).repeat(1, 1, self.horizon)
+
+        # Construct full prediction tensor
         full_pred = x.new_zeros((x.size(0), self.num_nodes, self.horizon))
         full_pred.index_copy_(1, self.manipulated_indices, m_pred)
         full_pred.index_copy_(1, self.control_indices, control_pred)

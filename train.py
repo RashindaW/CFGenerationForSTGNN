@@ -53,6 +53,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        choices=["none", "step", "cosine", "plateau"],
+        default="none",
+        help="Learning rate scheduler type.",
+    )
+    parser.add_argument("--scheduler_step_size", type=int, default=10, help="Step size for StepLR scheduler.")
+    parser.add_argument("--scheduler_gamma", type=float, default=0.1, help="Decay factor for StepLR/ReduceLROnPlateau.")
+    parser.add_argument("--scheduler_patience", type=int, default=5, help="Patience for ReduceLROnPlateau scheduler.")
+    parser.add_argument("--scheduler_min_lr", type=float, default=1e-6, help="Minimum learning rate for schedulers.")
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--hidden_channels", type=int, default=32)
     parser.add_argument("--num_layers", type=int, default=2, help="Number of STGCN blocks.")
@@ -95,6 +106,14 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated global node indices used as target nodes (subset of manipulated).",
     )
     parser.add_argument("--tcn_dilation_base", type=int, default=2, help="TCN dilation base for causal_forecaster.")
+    parser.add_argument(
+        "--control_last_weight",
+        type=float,
+        default=None,
+        help="Percent (0-100) of weight for last lag timestep of control nodes. "
+             "Remaining weight is distributed equally among earlier timesteps. "
+             "Only applies to causal_forecaster model.",
+    )
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience.")
     parser.add_argument("--device", type=str, default=None)
@@ -380,6 +399,7 @@ def build_model(args: argparse.Namespace, bundle: TemporalDatasetBundle, device:
             decoder_dropout=args.dropout,
             activation="relu",
             target_channel=args.target_channel,
+            control_last_weight=getattr(args, "control_last_weight", None),
         )
         model = CausalDualStreamForecaster(config, adjacency=adjacency)
         return model.to(device)
@@ -427,6 +447,38 @@ def build_lag_weights(lag: int, last_weight_percent: Optional[float]) -> Optiona
     weights = torch.full((lag,), other_share, dtype=torch.float32)
     weights[-1] = last_share
     return weights
+
+
+def build_scheduler(
+    args: argparse.Namespace,
+    optimizer: torch.optim.Optimizer,
+) -> Optional[torch.optim.lr_scheduler.LRScheduler]:
+    """Build learning rate scheduler based on args."""
+    if args.scheduler == "none":
+        return None
+    elif args.scheduler == "step":
+        return torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=args.scheduler_step_size,
+            gamma=args.scheduler_gamma,
+        )
+    elif args.scheduler == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.scheduler_min_lr,
+        )
+    elif args.scheduler == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=args.scheduler_gamma,
+            patience=args.scheduler_patience,
+            min_lr=args.scheduler_min_lr,
+            verbose=False,
+        )
+    else:
+        return None
 
 
 def forward_pass(
@@ -760,6 +812,7 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
 
     criterion = nn.L1Loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = build_scheduler(args, optimizer)
     lag_weights = build_lag_weights(args.lag, args.lag_last_weight_percent)
 
     run_dir = Path(getattr(args, "resolved_run_dir"))
@@ -803,14 +856,17 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
         )
 
         if rank == 0:
+            current_lr = optimizer.param_groups[0]["lr"]
+            lr_str = f" | LR: {current_lr:.2e}" if scheduler is not None else ""
             print(
                 f"Epoch {epoch:03d} | "
                 f"Train Loss: {train_stats['loss']:.4f} MAE: {train_stats['mae']:.4f} RMSE: {train_stats['rmse']:.4f} | "
                 f"Val Loss: {val_stats['loss']:.4f} MAE: {val_stats['mae']:.4f} RMSE: {val_stats['rmse']:.4f}"
+                f"{lr_str}"
             )
             append_metrics_row(
                 metrics_path,
-                ["epoch", "train_loss", "train_mae", "train_rmse", "val_loss", "val_mae", "val_rmse"],
+                ["epoch", "train_loss", "train_mae", "train_rmse", "val_loss", "val_mae", "val_rmse", "learning_rate"],
                 [
                     epoch,
                     train_stats["loss"],
@@ -819,6 +875,7 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
                     val_stats["loss"],
                     val_stats["mae"],
                     val_stats["rmse"],
+                    current_lr,
                 ],
             )
             if val_stats["loss"] < best_val_loss:
@@ -834,6 +891,13 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
                 if args.patience and patience_counter >= args.patience:
                     print("Early stopping triggered.")
                     stop_training = True
+
+        # Step the learning rate scheduler
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_stats["loss"])
+            else:
+                scheduler.step()
 
         if distributed:
             stop_tensor = torch.tensor(1 if stop_training else 0, device=device)

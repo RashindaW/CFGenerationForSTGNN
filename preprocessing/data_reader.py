@@ -79,7 +79,14 @@ class DataReader:
         num_nodes = values.shape[1]
         num_features = values.shape[2]
 
-        scaler = StandardScaler(mean=values[..., self.target_channel].mean(), std=values[..., self.target_channel].std())
+        # Compute scaler from training data only to avoid data leakage
+        train_end = int(len(values) * self.train_ratio)
+        train_values = values[:train_end]
+
+        scaler = StandardScaler(
+            mean=train_values[..., self.target_channel].mean(),
+            std=train_values[..., self.target_channel].std()
+        )
         values[..., self.target_channel] = scaler.transform(values[..., self.target_channel])
 
         train_data, val_data, test_data = self._split(values)
