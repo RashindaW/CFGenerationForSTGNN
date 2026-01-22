@@ -828,18 +828,47 @@ def compute_mask_target_value(
     iterative_predictions: Optional[torch.Tensor],
     target_node: int,
     alpha: float,
+    target_local_idx: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
+    """Compute mask value for target history masking.
+
+    Args:
+        mode: Masking mode ('zeros', 'guidance', 'alternating', 'blend')
+        step: Current iteration step
+        guidance_target: Target guidance tensor. Shape is either:
+            - (num_nodes, horizon) for full mode
+            - (1, horizon) for single-target mode (use_manip_only)
+        iterative_predictions: Previous predictions. Shape is either:
+            - (num_nodes, iter_steps) for full mode
+            - (num_manip, iter_steps) for manip-only mode
+        target_node: Global target node index (used for validation in full mode)
+        alpha: Blend factor for 'blend' mode
+        target_local_idx: Local index in manipulated list for manip-only mode.
+            If provided, uses index 0 for guidance_target and this index for predictions.
+    """
     if mode == "zeros":
         return None
     if guidance_target is None:
         raise ValueError("guidance_target is required for non-zero mask_target_history modes.")
-    if target_node < 0 or target_node >= guidance_target.size(0):
-        raise ValueError(f"target node {target_node} is out of range for {guidance_target.size(0)} nodes")
+
     guidance_idx = max(step - 1, 0)
-    guidance_val = guidance_target[target_node, guidance_idx]
-    forecast_val = guidance_val
-    if iterative_predictions is not None and step > 0:
-        forecast_val = iterative_predictions[target_node, step - 1]
+
+    # Handle different tensor shapes based on target_local_idx
+    if target_local_idx is not None:
+        # Single-target mode: guidance_target is (1, horizon), predictions is (num_manip, iter_steps)
+        guidance_val = guidance_target[0, guidance_idx]
+        forecast_val = guidance_val
+        if iterative_predictions is not None and step > 0:
+            forecast_val = iterative_predictions[target_local_idx, step - 1]
+    else:
+        # Full mode: guidance_target is (num_nodes, horizon), predictions is (num_nodes, iter_steps)
+        if target_node < 0 or target_node >= guidance_target.size(0):
+            raise ValueError(f"target node {target_node} is out of range for {guidance_target.size(0)} nodes")
+        guidance_val = guidance_target[target_node, guidance_idx]
+        forecast_val = guidance_val
+        if iterative_predictions is not None and step > 0:
+            forecast_val = iterative_predictions[target_node, step - 1]
+
     if mode == "guidance":
         return guidance_val
     if mode == "alternating":
@@ -2089,14 +2118,42 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         best_windows: list[torch.Tensor] = []
         mse_per_step: list[float] = []
         best_indices: list[int] = []
-        iterative_predictions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
-        iterative_actions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
+
+        # For causal_forecaster with perturbation control, use manipulated-only tensors
+        # Otherwise use full node tensors for backward compatibility
+        use_manip_only = (
+            args.control_method in ("gradient", "jacobian", "perturbation")
+            and short_model_type == "causal_forecaster"
+            and hasattr(short_forecaster, "manipulated_indices")
+        )
+
+        if use_manip_only:
+            num_manip = len(short_forecaster.manipulated_indices)
+            iterative_predictions = torch.zeros((num_manip, iter_steps), device=device)
+            iterative_actions = torch.zeros((num_manip, iter_steps), device=device)
+        else:
+            iterative_predictions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
+            iterative_actions = torch.zeros((bundle.num_nodes, iter_steps), device=device)
+
         iterative_prev_last_lag = torch.zeros((bundle.num_nodes, iter_steps), device=device)
         iterative_edited_last_lag = torch.zeros((bundle.num_nodes, iter_steps), device=device)
         iterative_targets = torch.zeros((bundle.num_nodes, iter_steps), device=device)
         if guidance_target is None:
             raise ValueError("guidance_target is required for iterative guidance.")
-        target_series = guidance_target.to(device)
+
+        # For perturbation control, extract only the target node's guidance: (1, horizon)
+        # For diffusion, keep full guidance: (num_nodes, horizon)
+        target_local_idx = None  # Local index of target node in manipulated indices
+        if use_manip_only and args.target_adjust_node >= 0:
+            # Extract single target node guidance: (1, horizon)
+            target_series = guidance_target[args.target_adjust_node : args.target_adjust_node + 1, :].to(device)
+            # Compute local index of target node in manipulated list
+            model_manip_indices = short_forecaster.manipulated_indices
+            local_idx_tensor = (model_manip_indices == args.target_adjust_node).nonzero(as_tuple=True)[0]
+            if len(local_idx_tensor) > 0:
+                target_local_idx = int(local_idx_tensor[0].item())
+        else:
+            target_series = guidance_target.to(device)
 
         edit_mask = torch.zeros_like(base_mask)
         edit_mask[-1] = 1.0
@@ -2174,6 +2231,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                     iterative_predictions,
                     args.target_adjust_node,
                     args.mask_target_history_alpha,
+                    target_local_idx=target_local_idx if use_manip_only else None,
                 )
             with torch.no_grad():
                 step_input = prepare_forecaster_input(current_window.unsqueeze(0))
@@ -2185,13 +2243,18 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                     step_pred_manip = short_forecaster.forward_manipulated_only(step_input)
                     step_pred_manip = step_pred_manip[:, :, :1].squeeze(0)  # (num_manip, 1)
 
-                    # Map back to full tensor
+                    # Map back to full tensor for other uses
                     model_manip_indices = short_forecaster.manipulated_indices
                     step_pred = torch.zeros((bundle.num_nodes, 1), device=device)
                     step_pred[model_manip_indices, :] = step_pred_manip
 
-                    # Store actions for manipulated nodes only
-                    iterative_actions[model_manip_indices, step] = step_pred_manip.squeeze(-1)
+                    # Store actions
+                    if use_manip_only:
+                        # iterative_actions is (num_manip, iter_steps) - store directly
+                        iterative_actions[:, step] = step_pred_manip.squeeze(-1)
+                    else:
+                        # iterative_actions is (num_nodes, iter_steps) - use global indices
+                        iterative_actions[model_manip_indices, step] = step_pred_manip.squeeze(-1)
                 else:
                     step_pred = forecaster_module.forward_pass(
                         short_forecaster,
@@ -2207,8 +2270,16 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                     step_pred = step_pred.squeeze(0)
                     iterative_actions[:, step] = step_pred.squeeze(-1)
 
+            # step_target shape depends on use_manip_only:
+            # - use_manip_only=True: (1, 1) for single target node
+            # - use_manip_only=False: (num_nodes, 1) for all nodes
             step_target = target_series[:, step : step + 1]
-            iterative_targets[:, step] = step_target.squeeze(-1)
+
+            # Store targets for logging (always use full guidance_target for this)
+            if use_manip_only and args.target_adjust_node >= 0:
+                iterative_targets[args.target_adjust_node, step] = step_target.squeeze()
+            else:
+                iterative_targets[:, step] = step_target.squeeze(-1)
 
             if args.control_method == "diffusion":
                 # Diffusion-based generation (original method)
@@ -2282,7 +2353,10 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             else:
                 # Gradient, Jacobian, or Perturbation-based control method
                 # Get target for the specific target nodes
-                if args.target_adjust_node >= 0:
+                if use_manip_only and args.target_adjust_node >= 0:
+                    # step_target is already (1, 1) for single target node
+                    y_desired = step_target  # (1, 1)
+                elif args.target_adjust_node >= 0:
                     y_desired = step_target[args.target_adjust_node : args.target_adjust_node + 1, :]
                 else:
                     # Use all non-control nodes as targets
@@ -2315,12 +2389,17 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                         # Get manipulated_indices from the model to map back to global indices
                         model_manip_indices = short_forecaster.manipulated_indices
 
-                        # Create full prediction tensor and fill in manipulated predictions
+                        # Create full prediction tensor for window rolling
                         best_pred = torch.zeros((bundle.num_nodes, 1), device=device)
                         best_pred[model_manip_indices, :] = cf_pred_manip
 
-                        # Store predictions (only manipulated nodes have valid values)
-                        iterative_predictions[model_manip_indices, step] = cf_pred_manip.squeeze(-1)
+                        # Store predictions
+                        if use_manip_only:
+                            # iterative_predictions is (num_manip, iter_steps) - store directly
+                            iterative_predictions[:, step] = cf_pred_manip.squeeze(-1)
+                        else:
+                            # iterative_predictions is (num_nodes, iter_steps) - use global indices
+                            iterative_predictions[model_manip_indices, step] = cf_pred_manip.squeeze(-1)
 
                         # For MSE, compare only at target nodes
                         if args.target_adjust_node >= 0:
@@ -2328,7 +2407,11 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                             target_local_idx = (model_manip_indices == args.target_adjust_node).nonzero(as_tuple=True)[0]
                             if len(target_local_idx) > 0:
                                 pred_at_target = cf_pred_manip[target_local_idx[0], :]
-                                target_at_step = step_target[args.target_adjust_node, :]
+                                # step_target is (1, 1) if use_manip_only, else (num_nodes, 1)
+                                if use_manip_only:
+                                    target_at_step = step_target[0, :]  # (1,)
+                                else:
+                                    target_at_step = step_target[args.target_adjust_node, :]
                                 mse_step = ((pred_at_target - target_at_step) ** 2).mean()
                             else:
                                 mse_step = torch.tensor(float("inf"), device=device)
@@ -2387,7 +2470,21 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 # and will be duplicated into the next position naturally
             current_window = torch.cat([best_window[1:], next_step.unsqueeze(0)], dim=0)
 
-        iterative_predictions_cpu = iterative_predictions.detach().cpu()
+        # Reconstruct full-size tensors for plotting/saving if using manip-only mode
+        if use_manip_only:
+            model_manip_indices = short_forecaster.manipulated_indices.cpu()
+            # Expand iterative_predictions from (num_manip, iter_steps) to (num_nodes, iter_steps)
+            full_predictions = torch.zeros((bundle.num_nodes, iter_steps))
+            full_predictions[model_manip_indices, :] = iterative_predictions.cpu()
+            iterative_predictions_cpu = full_predictions
+            # Expand iterative_actions similarly
+            full_actions = torch.zeros((bundle.num_nodes, iter_steps))
+            full_actions[model_manip_indices, :] = iterative_actions.cpu()
+            iterative_actions_cpu = full_actions
+        else:
+            iterative_predictions_cpu = iterative_predictions.detach().cpu()
+            iterative_actions_cpu = iterative_actions.detach().cpu()
+
         iterative_prev_last_lag_cpu = iterative_prev_last_lag.detach().cpu()
         iterative_edited_last_lag_cpu = iterative_edited_last_lag.detach().cpu()
         iterative_targets_cpu = iterative_targets.detach().cpu()
