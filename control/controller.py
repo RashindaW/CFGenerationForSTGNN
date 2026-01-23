@@ -77,6 +77,8 @@ class CausalController:
             config = JacobianConfig(
                 regularization=method_kwargs.get("regularization", 1e-4),
                 max_delta=method_kwargs.get("max_delta", None),
+                max_iterations=method_kwargs.get("max_iterations", 10),
+                convergence_tol=method_kwargs.get("convergence_tol", 1e-4),
             )
             self._controller = JacobianController(
                 forecaster=forecaster,
@@ -149,10 +151,16 @@ class CausalController:
                 },
             }
         elif self.method == "jacobian":
-            x_new, delta_x, y_predicted, jacobian = self._controller.find_intervention(
+            x_new, delta_x, y_predicted, jacobian_info = self._controller.find_intervention(
                 current_window, y_desired, target_channel
             )
-            sensitivities = self._controller.analyze_sensitivities(jacobian)
+            # Extract jacobian from info dict for sensitivity analysis
+            jacobian = jacobian_info.get("jacobian")
+            sensitivities = (
+                self._controller.analyze_sensitivities(jacobian)
+                if jacobian is not None
+                else {}
+            )
             return {
                 "x_optimal": x_new,
                 "y_predicted": y_predicted,
@@ -161,6 +169,12 @@ class CausalController:
                     "jacobian": jacobian,
                     "sensitivities": sensitivities,
                     "method": "jacobian",
+                    # Include iteration diagnostics
+                    "iterations": jacobian_info.get("iterations", 1),
+                    "initial_error": jacobian_info.get("initial_error"),
+                    "final_error": jacobian_info.get("final_error"),
+                    "improvement_percent": jacobian_info.get("improvement_percent"),
+                    "converged": jacobian_info.get("converged", False),
                 },
             }
         elif self.method == "perturbation":

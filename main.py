@@ -53,7 +53,7 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["METRLA", "PEMSBAY", "TEP", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
+        choices=["METRLA", "PEMSBAY", "TEP", "TEP_SMOOTH10", "TEP_SMOOTH20", "TEP_SMOOTH60", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
         default="METRLA",
     )
     parser.add_argument("--data_root", type=str, default=None)
@@ -212,7 +212,7 @@ def add_subgraph_subcommand(subparsers: argparse._SubParsersAction[argparse.Argu
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["METRLA", "PEMSBAY", "TEP", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
+        choices=["METRLA", "PEMSBAY", "TEP", "TEP_SMOOTH10", "TEP_SMOOTH20", "TEP_SMOOTH60", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
         default="METRLA",
     )
     parser.add_argument("--data_root", type=str, default=None, help="Root directory containing dataset folders.")
@@ -505,6 +505,18 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
         type=float,
         default=None,
         help="Maximum allowed change magnitude per control node for Jacobian method.",
+    )
+    parser.add_argument(
+        "--jacobian_max_iter",
+        type=int,
+        default=10,
+        help="Maximum iterations for Jacobian Gauss-Newton refinement.",
+    )
+    parser.add_argument(
+        "--jacobian_convergence_tol",
+        type=float,
+        default=1e-4,
+        help="Convergence tolerance for Jacobian iterative refinement.",
     )
     # Perturbation method arguments
     parser.add_argument(
@@ -2062,13 +2074,19 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
 
     sample_shape = torch.Size(past_window.shape)  # (T, N, F)
 
+    # Transform rate_limit from original scale to standardized scale
+    # Rate limit represents a delta, so we scale by 1/std
+    scaled_rate_limit = None
+    if args.rate_limit is not None:
+        scaled_rate_limit = args.rate_limit / bundle.scaler.std
+
     guidance_config = GuidanceConfig(
         lambda_scale=args.lambda_scale,
         eta=args.eta,
         temporal_weight=args.temporal_weight,
         spatial_weight=args.spatial_weight,
         control_energy_weight=args.control_weight,
-        rate_limit=args.rate_limit,
+        rate_limit=scaled_rate_limit,
         clamp_min=args.clamp_min,
         clamp_max=args.clamp_max,
         anchor_start_weight=args.anchor_start_weight,
@@ -2160,6 +2178,15 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         edit_mask = edit_mask * base_mask
         edit_mask = edit_mask.to(device)
 
+        # Transform CLI bounds from original scale to standardized scale (for all methods)
+        scaled_lower_bound = None
+        scaled_upper_bound = None
+        if args.lower_bound is not None or args.upper_bound is not None:
+            scaler_mean = short_bundle.scaler.mean
+            scaler_std = short_bundle.scaler.std
+            scaled_lower_bound = (args.lower_bound - scaler_mean) / scaler_std if args.lower_bound is not None else None
+            scaled_upper_bound = (args.upper_bound - scaler_mean) / scaler_std if args.upper_bound is not None else None
+
         # Setup for gradient/jacobian/perturbation control methods
         controller = None
         control_indices = None
@@ -2196,6 +2223,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 method_kwargs = {
                     "regularization": args.jacobian_reg,
                     "max_delta": args.jacobian_max_delta,
+                    "max_iterations": args.jacobian_max_iter,
+                    "convergence_tol": args.jacobian_convergence_tol,
                 }
             elif args.control_method == "perturbation":
                 method_kwargs = {
@@ -2206,13 +2235,16 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                     "finite_diff_eps": args.perturbation_eps,
                 }
 
+            # Use pre-computed scaled bounds for controller
+            x_bounds_scaled = (scaled_lower_bound, scaled_upper_bound) if scaled_lower_bound is not None or scaled_upper_bound is not None else None
+
             controller = CausalController(
                 forecaster=short_forecaster,
                 control_indices=control_indices,
                 target_indices=target_indices,
                 adjacency=short_bundle.adjacency.to(device),
                 method=args.control_method,
-                x_bounds=(args.lower_bound, args.upper_bound) if args.lower_bound is not None or args.upper_bound is not None else None,
+                x_bounds=x_bounds_scaled,
                 model_type=short_model_type,
                 lag_weights=short_meta.get("lag_weights"),
                 neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
@@ -2294,8 +2326,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                     mask=mask_batched,
                     adjacency=bundle.adjacency.to(device),
                     config=guidance_config,
-                    lower_bounds=args.lower_bound,
-                    upper_bounds=args.upper_bound,
+                    lower_bounds=scaled_lower_bound,
+                    upper_bounds=scaled_upper_bound,
                     baseline=baseline_step,
                     anchor_weights=anchor_step,
                     node_weights=node_weights,
@@ -2401,6 +2433,15 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                             # iterative_predictions is (num_nodes, iter_steps) - use global indices
                             iterative_predictions[model_manip_indices, step] = cf_pred_manip.squeeze(-1)
 
+                        # Debug: Show prediction at target node and compare with desired
+                        if step == 0 or step == iter_steps - 1 or (step + 1) % 10 == 0:
+                            target_local_idx_dbg = (model_manip_indices == args.target_adjust_node).nonzero(as_tuple=True)[0]
+                            if len(target_local_idx_dbg) > 0:
+                                pred_val = cf_pred_manip[target_local_idx_dbg[0]].item()
+                                desired_val = step_target[0].item() if use_manip_only else step_target[args.target_adjust_node].item()
+                                print(f"[DEBUG] Step {step}: target_node_{args.target_adjust_node}_pred = {pred_val:.4f}, "
+                                      f"desired = {desired_val:.4f}, diff = {abs(pred_val - desired_val):.4f}")
+
                         # For MSE, compare only at target nodes
                         if args.target_adjust_node >= 0:
                             # Find local index of target in manipulated list
@@ -2489,6 +2530,17 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         iterative_edited_last_lag_cpu = iterative_edited_last_lag.detach().cpu()
         iterative_targets_cpu = iterative_targets.detach().cpu()
         final_window = current_window.detach().cpu()
+
+        # Debug: Summary of prediction statistics to verify they change across steps
+        if args.target_adjust_node >= 0:
+            target_preds = iterative_predictions_cpu[args.target_adjust_node, :]
+            target_targets = iterative_targets_cpu[args.target_adjust_node, :]
+            print(f"[DEBUG] Iteration complete - Prediction stats for target node {args.target_adjust_node}:")
+            print(f"  Predictions: min={target_preds.min():.4f}, max={target_preds.max():.4f}, "
+                  f"std={target_preds.std():.4f}, range={target_preds.max() - target_preds.min():.4f}")
+            print(f"  Targets: min={target_targets.min():.4f}, max={target_targets.max():.4f}, "
+                  f"std={target_targets.std():.4f}")
+            print(f"  Mean absolute error: {(target_preds - target_targets).abs().mean():.4f}")
         baseline_slice = baseline_forecast[:, :iter_steps]
         adjusted_slice = adjusted_target[:, :iter_steps]
         default_slice = default_target[:, :iter_steps]
@@ -2531,7 +2583,20 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             lag_values = inverse_target_scale(lag_values, bundle.scaler).permute(1, 0)
             horizon_ground_truth = truncate_horizon(target_future, iter_steps).cpu()
             horizon_ground_truth = inverse_target_scale(horizon_ground_truth, bundle.scaler)
-            horizon_counterfactual = iterative_predictions_cpu[:, :iter_steps]
+            horizon_counterfactual = iterative_predictions_cpu[:, :iter_steps].clone()
+
+            # For control nodes (XMV), use the edited values from iterative_edited_last_lag
+            # instead of zeros (which become mean after inverse scaling)
+            if use_manip_only and short_model_type == "causal_forecaster":
+                model_manip_indices = short_forecaster.manipulated_indices.cpu()
+                all_indices = set(range(bundle.num_nodes))
+                manip_set = set(model_manip_indices.tolist())
+                control_node_indices = sorted(all_indices - manip_set)
+                if control_node_indices:
+                    control_indices_tensor = torch.tensor(control_node_indices, dtype=torch.long)
+                    # Use the edited last lag values for control nodes (already in standardized scale)
+                    horizon_counterfactual[control_indices_tensor, :] = iterative_edited_last_lag_cpu[control_indices_tensor, :iter_steps]
+
             horizon_counterfactual = inverse_target_scale(horizon_counterfactual, bundle.scaler)
             top_window_plot_paths = save_iterative_cf_window_plots(
                 top_window_plot_path,
@@ -2731,6 +2796,15 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             "Non-iterative counterfactual generation only supports --control_method diffusion."
         )
 
+    # Transform CLI bounds from original scale to standardized scale (non-iterative path)
+    noniter_scaled_lower = None
+    noniter_scaled_upper = None
+    if args.lower_bound is not None or args.upper_bound is not None:
+        scaler_mean = bundle.scaler.mean
+        scaler_std = bundle.scaler.std
+        noniter_scaled_lower = (args.lower_bound - scaler_mean) / scaler_std if args.lower_bound is not None else None
+        noniter_scaled_upper = (args.upper_bound - scaler_mean) / scaler_std if args.upper_bound is not None else None
+
     mask = base_mask.to(device)
     target_batched = guidance_target.unsqueeze(0).repeat(args.samples, 1, 1).to(device)
     mask_batched = mask.unsqueeze(0).repeat(args.samples, 1, 1, 1).to(device)
@@ -2740,8 +2814,8 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         mask=mask_batched,
         adjacency=bundle.adjacency.to(device),
         config=guidance_config,
-        lower_bounds=args.lower_bound,
-        upper_bounds=args.upper_bound,
+        lower_bounds=noniter_scaled_lower,
+        upper_bounds=noniter_scaled_upper,
         baseline=baseline_forecast,
         anchor_weights=anchor_weights,
         node_weights=node_weights,

@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["METRLA", "PEMSBAY", "TEP", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
+        choices=["METRLA", "PEMSBAY", "TEP", "TEP_SMOOTH10", "TEP_SMOOTH20", "TEP_SMOOTH60", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
         default="METRLA",
     )
     parser.add_argument("--data_root", type=str, default=None, help="Path to dataset root directory.")
@@ -352,10 +352,10 @@ def build_model(args: argparse.Namespace, bundle: TemporalDatasetBundle, device:
             num_for_predict=args.horizon,
             len_input=args.lag,
         )
-        
+
         model = MSTGCN(config, adjacency=adjacency)
         return model.to(device)
-    
+
     elif args.model == "astgcn":
         config = ASTGCNConfig(
             num_of_vertices=bundle.num_nodes,
@@ -504,6 +504,30 @@ def forward_pass(
         if output.size(1) == 1:
             output = output.squeeze(1)  # (batch, nodes, horizon)
         else:
+            output = output.mean(dim=1)
+        return output
+
+    if model_type == "causal_forecaster":
+        # For causal_forecaster, use forward_manipulated_only to get proper predictions
+        # that reflect control node influence on manipulated nodes
+        if hasattr(model, "forward_manipulated_only"):
+            output = model.forward_manipulated_only(x)
+            # Output shape: (B, num_manip, H)
+            # Need to expand to (B, num_nodes, H) for compatibility
+            if hasattr(model, "manipulated_indices") and hasattr(model, "num_nodes"):
+                full_output = torch.zeros(
+                    (output.size(0), model.num_nodes, output.size(-1)),
+                    device=output.device,
+                    dtype=output.dtype,
+                )
+                full_output[:, model.manipulated_indices, :] = output
+                output = full_output
+        else:
+            # Fallback to forward with manipulated_only=True
+            output = model(x, manipulated_only=True)
+        if output.dim() == 4 and output.size(1) == 1:
+            output = output.squeeze(1)
+        elif output.dim() == 4:
             output = output.mean(dim=1)
         return output
 
