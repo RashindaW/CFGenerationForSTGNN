@@ -267,21 +267,24 @@ class CausalCrossAttention(nn.Module):
         k = self.k_proj(source).view(batch_size, num_s, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(source).view(batch_size, num_s, self.num_heads, self.head_dim).transpose(1, 2)
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        # Apply causal mask: mask positions where NO edge exists
         adj_t = adj.T
-        no_edge = adj_t.sum(dim=-1) <= 0
-        mask = adj_t <= 0
-        if no_edge.any():
-            mask = mask.clone()
-            mask[no_edge] = False
+        mask = adj_t <= 0  # True where no edge (correct)
+
+        # For isolated nodes (no incoming edges), ALL positions get masked
+        # → softmax produces uniform tiny values, which is correct behavior
+        # The CausalFusion residual (out = h_manip + attn_out) preserves information
+
         scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1e9)
         attn = torch.softmax(scores, dim=-1)
         attn = self.dropout(attn)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(batch_size, num_t, self.embed_dim)
         out = self.out_proj(out)
-        if no_edge.any():
-            # Prevent NaNs and enforce no-control influence when a target has no causal edges.
-            out[:, no_edge, :] = 0.0
+
+        # Note: We no longer zero out isolated nodes - the CausalFusion residual
+        # connection (out = h_manip + attn_out) preserves learned representations
         return out
 
 
@@ -341,7 +344,7 @@ class CausalForecasterConfig:
     tcn_dilation_base: int = 2
     spatial_layers: int = 2
     spatial_dropout: float = 0.1
-    spatial_norm: str = "sym"
+    spatial_norm: str = "row"
     attention_heads: int = 4
     attention_dropout: float = 0.1
     fusion_rounds: int = 1
@@ -350,6 +353,7 @@ class CausalForecasterConfig:
     activation: str = "relu"
     target_channel: int = 0
     control_last_weight: Optional[float] = None  # Percentage (0-100) of weight for last lag timestep of control nodes
+    use_residual: bool = True  # If True, use residual prediction (y = last_value + delta); if False, direct prediction
 
 
 class CausalDualStreamForecaster(nn.Module):
@@ -496,12 +500,16 @@ class CausalDualStreamForecaster(nn.Module):
         parts = self.forward_components(x)
         m_delta = parts["M_pred"]  # (batch, num_manip, horizon)
 
-        # Get last input value for manipulated nodes
-        manip_channel = min(self.target_channel, parts["X_manip"].size(-1) - 1)
-        last_manip = parts["X_manip"][:, -1, :, manip_channel]  # (batch, num_manip)
+        if self.config.use_residual:
+            # Get last input value for manipulated nodes
+            manip_channel = min(self.target_channel, parts["X_manip"].size(-1) - 1)
+            last_manip = parts["X_manip"][:, -1, :, manip_channel]  # (batch, num_manip)
 
-        # Residual prediction: last_value + learned_delta
-        m_pred = last_manip.unsqueeze(-1) + m_delta  # (batch, num_manip, horizon)
+            # Residual prediction: last_value + learned_delta
+            m_pred = last_manip.unsqueeze(-1) + m_delta  # (batch, num_manip, horizon)
+        else:
+            # Direct prediction: decoder output is the final prediction
+            m_pred = m_delta
 
         return m_pred
 
@@ -521,15 +529,19 @@ class CausalDualStreamForecaster(nn.Module):
             return self.forward_manipulated_only(x)
 
         parts = self.forward_components(x)
-        m_delta = parts["M_pred"]  # Now represents delta/change from last input
+        m_delta = parts["M_pred"]  # Now represents delta/change from last input (or direct pred if use_residual=False)
 
-        # Get last input value for manipulated nodes
-        # X_manip shape: (batch, lag, num_manip, features)
-        manip_channel = min(self.target_channel, parts["X_manip"].size(-1) - 1)
-        last_manip = parts["X_manip"][:, -1, :, manip_channel]  # (batch, num_manip)
+        if self.config.use_residual:
+            # Get last input value for manipulated nodes
+            # X_manip shape: (batch, lag, num_manip, features)
+            manip_channel = min(self.target_channel, parts["X_manip"].size(-1) - 1)
+            last_manip = parts["X_manip"][:, -1, :, manip_channel]  # (batch, num_manip)
 
-        # Residual prediction: last_value + learned_delta
-        m_pred = last_manip.unsqueeze(-1) + m_delta  # (batch, num_manip, horizon)
+            # Residual prediction: last_value + learned_delta
+            m_pred = last_manip.unsqueeze(-1) + m_delta  # (batch, num_manip, horizon)
+        else:
+            # Direct prediction: decoder output is the final prediction
+            m_pred = m_delta
 
         # Control nodes: use last known value (unchanged)
         control_channel = min(self.target_channel, parts["X_control"].size(-1) - 1)

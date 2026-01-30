@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
@@ -84,8 +85,15 @@ def parse_args() -> argparse.Namespace:
         "--spatial_norm",
         type=str,
         choices=["sym", "row"],
-        default="sym",
+        default="row",
         help="Adjacency normalization for causal_forecaster spatial GNN.",
+    )
+    parser.add_argument(
+        "--activation",
+        type=str,
+        choices=["relu", "gelu", "tanh"],
+        default="relu",
+        help="Activation function for causal_forecaster.",
     )
     parser.add_argument(
         "--control_nodes",
@@ -114,6 +122,32 @@ def parse_args() -> argparse.Namespace:
              "Remaining weight is distributed equally among earlier timesteps. "
              "Only applies to causal_forecaster model.",
     )
+    parser.add_argument(
+        "--delta_reg_weight",
+        type=float,
+        default=0.0,
+        help="Weight for anti-copy regularization loss that penalizes small deltas. "
+             "Only applies to causal_forecaster model.",
+    )
+    parser.add_argument(
+        "--delta_margin",
+        type=float,
+        default=0.01,
+        help="Minimum desired delta magnitude for anti-copy regularization. "
+             "Deltas smaller than this are penalized.",
+    )
+    parser.add_argument(
+        "--disable_residual",
+        action="store_true",
+        help="Disable residual connection in causal_forecaster (use direct prediction instead).",
+    )
+    parser.add_argument(
+        "--input_noise_std",
+        type=float,
+        default=0.0,
+        help="Standard deviation of Gaussian noise added to inputs during training. "
+             "Helps prevent model from learning trivial shortcuts.",
+    )
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience.")
     parser.add_argument("--device", type=str, default=None)
@@ -126,17 +160,6 @@ def parse_args() -> argparse.Namespace:
         choices=["full", "last"],
         default="full",
         help="Compute loss/metrics over the full horizon or only the final step.",
-    )
-    parser.add_argument(
-        "--lag_last_weight_percent",
-        type=float,
-        default=None,
-        help="Percent of input weight assigned to the last lag step; remaining weight is spread across earlier steps.",
-    )
-    parser.add_argument(
-        "--neighbor_only_inputs",
-        action="store_true",
-        help="Use only neighbor history by pre-aggregating inputs with an adjacency matrix that excludes self loops.",
     )
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.1)
@@ -397,9 +420,10 @@ def build_model(args: argparse.Namespace, bundle: TemporalDatasetBundle, device:
             fusion_rounds=args.fusion_rounds,
             decoder_layers=args.decoder_layers,
             decoder_dropout=args.dropout,
-            activation="relu",
+            activation=getattr(args, "activation", "relu"),
             target_channel=args.target_channel,
             control_last_weight=getattr(args, "control_last_weight", None),
+            use_residual=not getattr(args, "disable_residual", False),
         )
         model = CausalDualStreamForecaster(config, adjacency=adjacency)
         return model.to(device)
@@ -432,21 +456,6 @@ def apply_loss_mask(
     prediction = prediction.index_select(1, idx)
     target = target.index_select(1, idx)
     return prediction, target
-
-
-def build_lag_weights(lag: int, last_weight_percent: Optional[float]) -> Optional[torch.Tensor]:
-    if last_weight_percent is None:
-        return None
-    percent = float(last_weight_percent)
-    if percent < 0.0 or percent > 100.0:
-        raise ValueError("lag_last_weight_percent must be between 0 and 100.")
-    if lag <= 1:
-        return torch.ones(1, dtype=torch.float32)
-    last_share = percent / 100.0
-    other_share = (1.0 - last_share) / (lag - 1)
-    weights = torch.full((lag,), other_share, dtype=torch.float32)
-    weights[-1] = last_share
-    return weights
 
 
 def build_scheduler(
@@ -485,17 +494,7 @@ def forward_pass(
     model: torch.nn.Module,
     x: torch.Tensor,
     model_type: str,
-    lag_weights: Optional[torch.Tensor] = None,
-    adjacency: Optional[torch.Tensor] = None,
-    neighbor_only_inputs: bool = False,
 ) -> torch.Tensor:
-    if lag_weights is not None:
-        if lag_weights.numel() != x.size(-1):
-            raise ValueError("lag_weights length does not match the input lag dimension.")
-        weights = lag_weights.to(device=x.device, dtype=x.dtype).view(1, 1, 1, -1)
-        x = x * weights
-    if neighbor_only_inputs:
-        x = _neighbor_only_inputs(x, adjacency)
     if model_type == "graphwavenet":
         pad_len = max(0, getattr(model, "receptive_field", 1) - x.size(-1))
         padded_x = nn.functional.pad(x, (pad_len, 0, 0, 0))
@@ -540,37 +539,23 @@ def forward_pass(
     return output
 
 
-def _neighbor_only_inputs(x: torch.Tensor, adjacency: Optional[torch.Tensor]) -> torch.Tensor:
-    if adjacency is None:
-        raise ValueError("adjacency must be provided when neighbor_only_inputs is enabled.")
-    adj = adjacency.to(device=x.device, dtype=x.dtype)
-    if adj.dim() == 3 and adj.size(0) == 1:
-        adj = adj[0]
-    if adj.dim() == 2:
-        adj = adj.clone()
-        adj.fill_diagonal_(0)
-        denom = adj.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        adj = adj / denom
-        x_perm = x.permute(0, 1, 3, 2)
-        x_agg = torch.matmul(x_perm, adj.T)
-        return x_agg.permute(0, 1, 3, 2)
-    if adj.dim() == 3:
-        adj = adj.clone()
-        adj.diagonal(dim1=-2, dim2=-1).zero_()
-        denom = adj.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        adj = adj / denom
-        x_perm = x.permute(0, 1, 3, 2)
-        x_flat = x_perm.reshape(x_perm.size(0), -1, x_perm.size(-1))
-        x_agg = torch.bmm(x_flat, adj.transpose(1, 2))
-        x_agg = x_agg.reshape(x_perm.shape)
-        return x_agg.permute(0, 1, 3, 2)
-    raise ValueError("adjacency must have shape (N, N) or (B, N, N)")
-
-
 def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> Tuple[float, float]:
     mae = torch.mean(torch.abs(pred - target)).item()
     rmse = torch.sqrt(torch.mean((pred - target) ** 2)).item()
     return mae, rmse
+
+
+def delta_diversity_loss(delta: torch.Tensor, margin: float) -> torch.Tensor:
+    """Hinge loss penalizing small deltas to prevent 'copy last value' shortcut.
+
+    Args:
+        delta: Predicted delta/change tensor from the model.
+        margin: Minimum desired delta magnitude. Deltas smaller than this are penalized.
+
+    Returns:
+        Scalar loss: mean(max(0, margin - |delta|))
+    """
+    return F.relu(margin - delta.abs()).mean()
 
 
 def run_epoch(
@@ -583,9 +568,9 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     grad_clip: float | None = None,
     distributed: bool = False,
-    lag_weights: Optional[torch.Tensor] = None,
-    adjacency: Optional[torch.Tensor] = None,
-    neighbor_only_inputs: bool = False,
+    delta_reg_weight: float = 0.0,
+    delta_margin: float = 0.01,
+    input_noise_std: float = 0.0,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
@@ -594,25 +579,65 @@ def run_epoch(
     total_abs_error = 0.0
     total_sq_error = 0.0
     total_elements = 0.0
+    total_delta_reg = 0.0
 
     for batch in loader:
         x, target = prepare_batch(batch, device)
+
+        # Add input noise during training to prevent shortcuts
+        if is_train and input_noise_std > 0:
+            x = x + torch.randn_like(x) * input_noise_std
+
         if is_train:
             optimizer.zero_grad()
         with torch.set_grad_enabled(is_train):
-            prediction = forward_pass(
-                model,
-                x,
-                model_type,
-                lag_weights=lag_weights,
-                adjacency=adjacency,
-                neighbor_only_inputs=neighbor_only_inputs,
-            )
+            # For causal_forecaster with delta regularization, use forward_components
+            if model_type == "causal_forecaster" and delta_reg_weight > 0 and is_train:
+                model_ref = unwrap_model(model)
+
+                # Get components including delta
+                parts = model_ref.forward_components(x)
+                m_delta = parts["M_pred"]  # This is the delta before adding residual
+
+                # Compute prediction with residual if use_residual is True
+                if getattr(model_ref.config, "use_residual", True):
+                    manip_channel = min(model_ref.target_channel, parts["X_manip"].size(-1) - 1)
+                    last_manip = parts["X_manip"][:, -1, :, manip_channel]
+                    m_pred = last_manip.unsqueeze(-1) + m_delta
+                else:
+                    m_pred = m_delta
+
+                # Expand to full prediction
+                full_pred = x.new_zeros((x.size(0), model_ref.num_nodes, m_pred.size(-1)))
+                full_pred.index_copy_(1, model_ref.manipulated_indices, m_pred)
+
+                # Control nodes: use last known value
+                control_channel = min(model_ref.target_channel, parts["X_control"].size(-1) - 1)
+                control_last = parts["X_control"][:, -1, :, control_channel]
+                control_pred = control_last.unsqueeze(-1).repeat(1, 1, m_pred.size(-1))
+                full_pred.index_copy_(1, model_ref.control_indices, control_pred)
+
+                prediction = full_pred
+            else:
+                prediction = forward_pass(
+                    model,
+                    x,
+                    model_type,
+                )
+
             if loss_focus == "last":
                 prediction = prediction[..., -1:]
                 target = target[..., -1:]
             prediction, target = apply_loss_mask(model, prediction, target)
-            loss = criterion(prediction, target)
+            base_loss = criterion(prediction, target)
+
+            # Add delta regularization for causal_forecaster
+            loss = base_loss
+            if model_type == "causal_forecaster" and delta_reg_weight > 0 and is_train:
+                delta_reg = delta_diversity_loss(m_delta, delta_margin)
+                loss = base_loss + delta_reg_weight * delta_reg
+                total_delta_reg += delta_reg.item()
+
             if is_train:
                 loss.backward()
                 if grad_clip is not None:
@@ -621,7 +646,7 @@ def run_epoch(
         batch_elements = float(target.numel())
         abs_error = torch.sum(torch.abs(prediction - target)).item()
         sq_error = torch.sum((prediction - target) ** 2).item()
-        total_loss += loss.item() * batch_elements
+        total_loss += base_loss.item() * batch_elements
         total_abs_error += abs_error
         total_sq_error += sq_error
         total_elements += batch_elements
@@ -774,11 +799,6 @@ def test_pipeline(args: argparse.Namespace) -> None:
     criterion = nn.L1Loss()
     pbar = tqdm.tqdm(total=1, desc="Testing Progress")
     loss_focus = checkpoint_args.get("loss_focus", "full") if checkpoint_args else "full"
-    lag_last_weight_percent = (
-        checkpoint_args.get("lag_last_weight_percent", args.lag_last_weight_percent) if checkpoint_args else args.lag_last_weight_percent
-    )
-    lag_weights = build_lag_weights(lag, lag_last_weight_percent)
-    neighbor_only_inputs = checkpoint_args.get("neighbor_only_inputs", False) if checkpoint_args else False
     test_stats = run_epoch(
         model,
         loaders["test"],
@@ -786,9 +806,6 @@ def test_pipeline(args: argparse.Namespace) -> None:
         model_type,
         criterion,
         loss_focus=loss_focus,
-        lag_weights=lag_weights,
-        adjacency=bundle.adjacency,
-        neighbor_only_inputs=neighbor_only_inputs,
     )
     pbar.update(1)
     pbar.close()
@@ -837,7 +854,6 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
     criterion = nn.L1Loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = build_scheduler(args, optimizer)
-    lag_weights = build_lag_weights(args.lag, args.lag_last_weight_percent)
 
     run_dir = Path(getattr(args, "resolved_run_dir"))
     checkpoint_path = Path(getattr(args, "resolved_checkpoint_path"))
@@ -862,9 +878,9 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             optimizer=optimizer,
             grad_clip=args.grad_clip,
             distributed=distributed,
-            lag_weights=lag_weights,
-            adjacency=bundle.adjacency,
-            neighbor_only_inputs=args.neighbor_only_inputs,
+            delta_reg_weight=getattr(args, "delta_reg_weight", 0.0),
+            delta_margin=getattr(args, "delta_margin", 0.01),
+            input_noise_std=getattr(args, "input_noise_std", 0.0),
         )
         val_stats = run_epoch(
             model,
@@ -874,9 +890,6 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             criterion,
             loss_focus=args.loss_focus,
             distributed=distributed,
-            lag_weights=lag_weights,
-            adjacency=bundle.adjacency,
-            neighbor_only_inputs=args.neighbor_only_inputs,
         )
 
         if rank == 0:
@@ -940,15 +953,3 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
 
     if distributed:
         cleanup_distributed()
-
-
-def main() -> None:
-    args = parse_args()
-    if args.mode == "train":
-        train_pipeline(args)
-    else:
-        test_pipeline(args)
-
-
-if __name__ == "__main__":
-    main()

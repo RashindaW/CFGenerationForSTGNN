@@ -1,0 +1,103 @@
+Here is Claude's plan:                                                                                                                    
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Plan: Regularization to Prevent Cascade Forecaster "Copy Last Value" Shortcut                                                             
+                                                                                                                                           
+ Problem Summary                                                                                                                           
+                                                                                                                                           
+ The CascadeForecaster uses residual prediction (y_pred = last_value + delta). On smoothed data (TEP_SMOOTH60), the model learns delta ≈   
+ 0, essentially copying the last lag value as the forecast instead of learning meaningful temporal dynamics.                               
+                                                                                                                                           
+ Root Cause                                                                                                                                
+                                                                                                                                           
+ - Residual architecture in cascade_forecaster.py (lines 474, 519)                                                                         
+ - L1Loss doesn't penalize "persistence" predictions                                                                                       
+ - TEP_SMOOTH60's 60-point moving average creates highly autocorrelated data                                                               
+                                                                                                                                           
+ ---                                                                                                                                       
+ Implementation Plan                                                                                                                       
+                                                                                                                                           
+ Phase 1: Anti-Shortcut Regularization Losses (Primary Fix)                                                                                
+                                                                                                                                           
+ File: train.py                                                                                                                            
+                                                                                                                                           
+ 1. Add new command-line arguments (in parse_args()):                                                                                      
+ --diversity_loss_weight (float, default=0.0) - Weight for anti-copy loss                                                                  
+ --diversity_margin (float, default=0.01) - Minimum desired delta magnitude                                                                
+ --variance_reg_weight (float, default=0.0) - Weight for variance regularization                                                           
+ --min_variance (float, default=0.001) - Minimum prediction variance across horizon                                                        
+ 2. Create regularization loss functions (new section before _compute_cascade_loss_and_metrics):                                           
+   - prediction_diversity_loss(delta, margin) - Hinge loss penalizing small deltas                                                         
+   - variance_regularization(predictions, min_var) - Penalize flat predictions                                                             
+ 3. Modify _compute_cascade_loss_and_metrics to:                                                                                           
+   - Compute delta values: m_delta = m_pred - last_mediator, y_delta = y_pred - last_target                                                
+   - Add regularization terms to total loss when weights > 0                                                                               
+                                                                                                                                           
+ Phase 2: Architecture Options (Configurable Residual)                                                                                     
+                                                                                                                                           
+ File: models/cascade_forecaster.py                                                                                                        
+                                                                                                                                           
+ 1. Add config options to CascadeForecasterConfig:                                                                                         
+ use_residual: bool = True  # Can disable residual connection                                                                              
+ gated_residual: bool = False  # Learnable gate between residual and direct                                                                
+ 2. Modify forward methods (forward_stage1, forward_stage2):                                                                               
+   - If use_residual=False: return m_pred = m_delta (direct prediction)                                                                    
+   - If gated_residual=True: use learned gate to blend residual and direct                                                                 
+ 3. Add GatedResidual module (optional):                                                                                                   
+   - Learns when to use residual vs direct prediction per timestep                                                                         
+                                                                                                                                           
+ File: train.py                                                                                                                            
+ - Add --disable_residual and --gated_residual flags                                                                                       
+ - Pass to model config                                                                                                                    
+                                                                                                                                           
+ Phase 3: Data Augmentation                                                                                                                
+                                                                                                                                           
+ File: preprocessing/data_reader.py or train.py                                                                                            
+                                                                                                                                           
+ 1. Input noise injection (in batch preparation or dataset wrapper):                                                                       
+   - Add Gaussian noise to break smooth patterns                                                                                           
+   - Args: --input_noise_std (default=0.0)                                                                                                 
+ 2. Multi-smoothing training (already supported):                                                                                          
+   - Use --tep_all flag to train on TEP, TEP_SMOOTH10, TEP_SMOOTH20, TEP_SMOOTH60 together                                                 
+                                                                                                                                           
+ ---                                                                                                                                       
+ Files to Modify                                                                                                                           
+ ┌──────────────────────────────┬──────────────────────────────────────────────────────────────────────────┐                               
+ │             File             │                                 Changes                                  │                               
+ ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                               
+ │ train.py                     │ Add regularization args, loss functions, modify cascade loss computation │                               
+ ├──────────────────────────────┼──────────────────────────────────────────────────────────────────────────┤                               
+ │ models/cascade_forecaster.py │ Add use_residual, gated_residual config options; modify forward methods  │                               
+ └──────────────────────────────┴──────────────────────────────────────────────────────────────────────────┘                               
+ ---                                                                                                                                       
+ Recommended Training Configuration                                                                                                        
+                                                                                                                                           
+ Start with these settings to test regularization:                                                                                         
+ python train.py \                                                                                                                         
+   --model cascade_forecaster \                                                                                                            
+   --dataset TEP_SMOOTH60 \                                                                                                                
+   --diversity_loss_weight 0.1 \                                                                                                           
+   --diversity_margin 0.02 \                                                                                                               
+   --variance_reg_weight 0.05 \                                                                                                            
+   --min_variance 0.001                                                                                                                    
+                                                                                                                                           
+ Alternative with disabled residual:                                                                                                       
+ python train.py \                                                                                                                         
+   --model cascade_forecaster \                                                                                                            
+   --dataset TEP_SMOOTH60 \                                                                                                                
+   --disable_residual                                                                                                                      
+                                                                                                                                           
+ ---                                                                                                                                       
+ Verification Plan                                                                                                                         
+                                                                                                                                           
+ 1. Train with regularization and compare validation loss                                                                                  
+ 2. Run plot_forecaster_test_plotly.py on new checkpoint                                                                                   
+ 3. Visual inspection: Predictions should show temporal variation, not flat lines matching last lag value                                  
+ 4. Quantitative check: Compare MAE on test set; ensure delta predictions have non-zero variance                                           
+                                                                                                                                           
+ ---                                                                                                                                       
+ Implementation Priority                                                                                                                   
+                                                                                                                                           
+ 1. Diversity loss (most direct fix) - add to train.py                                                                                     
+ 2. Configurable residual - modify cascade_forecaster.py                                                                                   
+ 3. Input noise - simple data augmentation                                                                                                 
+ 4. Gated residual (advanced) - if simpler approaches insufficient   

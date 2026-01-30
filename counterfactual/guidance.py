@@ -76,12 +76,10 @@ class ForecastGuidance:
         baseline: Optional[torch.Tensor] = None,
         anchor_weights: Optional[torch.Tensor] = None,
         node_weights: Optional[torch.Tensor] = None,
-        neighbor_only_inputs: bool = False,
         masked_target_node: Optional[int] = None,
         masked_target_channel: Optional[int] = None,
         masked_target_value: Optional[torch.Tensor] = None,
         model_type: str = "stgcn",
-        lag_weights: Optional[torch.Tensor] = None,
     ) -> None:
         device = next(forecaster.parameters()).device
         self.forecaster = forecaster
@@ -93,12 +91,10 @@ class ForecastGuidance:
         self.lower_bounds = lower_bounds
         self.upper_bounds = upper_bounds
         self.baseline = baseline.to(device).float().unsqueeze(0) if baseline is not None else None
-        self.neighbor_only_inputs = neighbor_only_inputs
         self.masked_target_node = masked_target_node
         self.masked_target_channel = masked_target_channel
         self.masked_target_value = masked_target_value
         self.model_type = model_type
-        self.lag_weights = lag_weights
         if anchor_weights is not None:
             weights = anchor_weights.to(device).float().view(1, 1, -1)
         else:
@@ -109,8 +105,20 @@ class ForecastGuidance:
         self.forecaster.eval()
 
     def _apply_bounds(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply bounds to the sample tensor.
+
+        Handles both scalar bounds (applied uniformly) and per-node tensor bounds.
+        For per-node bounds, lower/upper have shape (N,) and are broadcast to
+        match x shape (B, T, N, F).
+        """
         lower = _broadcast_bounds(self.lower_bounds, x)
         upper = _broadcast_bounds(self.upper_bounds, x)
+        # Handle per-node bounds (1D tensor) by reshaping for broadcasting
+        # x shape: (B, T, N, F), bounds shape: (N,) -> (1, 1, N, 1)
+        if lower is not None and lower.dim() == 1:
+            lower = lower.view(1, 1, -1, 1)
+        if upper is not None and upper.dim() == 1:
+            upper = upper.view(1, 1, -1, 1)
         if lower is not None or upper is not None:
             x = torch.clamp(x, min=lower if lower is not None else None, max=upper if upper is not None else None)
         return x
@@ -156,9 +164,6 @@ class ForecastGuidance:
                 self.forecaster,
                 forecaster_input,
                 self.model_type,
-                lag_weights=self.lag_weights,
-                adjacency=self.adjacency,
-                neighbor_only_inputs=self.neighbor_only_inputs,
             )
             base_error = (prediction - self.target).pow(2)
             if self.node_weights is not None:

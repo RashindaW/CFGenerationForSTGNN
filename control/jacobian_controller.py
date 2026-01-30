@@ -51,8 +51,6 @@ class JacobianController:
         config: JacobianConfig,
         x_bounds: Optional[Tuple[float, float]] = None,
         model_type: str = "stgcn",
-        lag_weights: Optional[torch.Tensor] = None,
-        neighbor_only_inputs: bool = False,
     ):
         """Initialize the Jacobian-based controller.
 
@@ -64,8 +62,6 @@ class JacobianController:
             config: Controller configuration.
             x_bounds: (min, max) bounds for control values.
             model_type: Type of forecaster model.
-            lag_weights: Optional weights for lag dimensions.
-            neighbor_only_inputs: Whether to use neighbor-only inputs.
         """
         self.forecaster = forecaster
         self.control_indices = control_indices
@@ -74,8 +70,6 @@ class JacobianController:
         self.config = config
         self.x_bounds = x_bounds
         self.model_type = model_type
-        self.lag_weights = lag_weights
-        self.neighbor_only_inputs = neighbor_only_inputs
 
         self.device = next(forecaster.parameters()).device
         # Note: We keep the model in its current mode. For RNNs with cuDNN,
@@ -129,9 +123,6 @@ class JacobianController:
                 self.forecaster,
                 forecaster_input,
                 self.model_type,
-                lag_weights=self.lag_weights,
-                adjacency=self.adjacency,
-                neighbor_only_inputs=self.neighbor_only_inputs,
             )
 
             # Extract target predictions: (1, nodes, horizon) -> (num_target,)
@@ -203,9 +194,6 @@ class JacobianController:
                 self.forecaster,
                 forecaster_input,
                 self.model_type,
-                lag_weights=self.lag_weights,
-                adjacency=self.adjacency,
-                neighbor_only_inputs=self.neighbor_only_inputs,
             )
             y_initial = y_initial_full[0, self.target_indices, 0]  # (num_target,)
 
@@ -234,9 +222,6 @@ class JacobianController:
                     self.forecaster,
                     forecaster_input,
                     self.model_type,
-                    lag_weights=self.lag_weights,
-                    adjacency=self.adjacency,
-                    neighbor_only_inputs=self.neighbor_only_inputs,
                 )
                 y_current_pred = y_pred_full[0, self.target_indices, 0]  # (num_target,)
 
@@ -310,9 +295,6 @@ class JacobianController:
                 self.forecaster,
                 forecaster_input,
                 self.model_type,
-                lag_weights=self.lag_weights,
-                adjacency=self.adjacency,
-                neighbor_only_inputs=self.neighbor_only_inputs,
             )
             y_predicted = y_pred_full[0, self.target_indices, :1]  # (num_target, 1)
 
@@ -418,9 +400,6 @@ class JacobianController:
                     self.forecaster,
                     forecaster_input,
                     self.model_type,
-                    lag_weights=self.lag_weights,
-                    adjacency=self.adjacency,
-                    neighbor_only_inputs=self.neighbor_only_inputs,
                 )
                 y_pred_target = y_pred_full[0, self.target_indices, 0]  # (num_target,)
                 loss = ((y_pred_target - y_desired) ** 2).mean().item()
@@ -437,9 +416,19 @@ class JacobianController:
         return best_alpha
 
     def _project_constraints(self, x: torch.Tensor) -> torch.Tensor:
-        """Project control values onto feasible bounds."""
+        """Project control values onto feasible bounds.
+
+        Handles both scalar bounds (applied uniformly) and per-node tensor bounds.
+        For tensor bounds, x_min/x_max have shape (num_control,) and are broadcast
+        across the features dimension.
+        """
         if self.x_bounds is not None:
             x_min, x_max = self.x_bounds
+            # Handle per-node bounds (tensor) vs global bounds (scalar)
+            if isinstance(x_min, torch.Tensor):
+                x_min = x_min.view(-1, 1)  # (num_control, 1) for broadcasting
+            if isinstance(x_max, torch.Tensor):
+                x_max = x_max.view(-1, 1)  # (num_control, 1) for broadcasting
             x = torch.clamp(x, min=x_min, max=x_max)
         return x
 

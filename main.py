@@ -37,7 +37,7 @@ from counterfactual.subgraph import (
 )
 from control import CausalController
 from models.causal_forecaster import load_feature_names
-from preprocessing.data_reader import TemporalDatasetBundle, load_dataset
+from preprocessing.data_reader import TemporalDatasetBundle, compute_node_statistics, load_dataset
 from preprocessing.graphwavenet_utils import StandardScaler
 from train import build_dataloaders, train_pipeline, test_pipeline
 
@@ -94,8 +94,15 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
         "--spatial_norm",
         type=str,
         choices=["sym", "row"],
-        default="sym",
+        default="row",
         help="Adjacency normalization for causal_forecaster spatial GNN.",
+    )
+    parser.add_argument(
+        "--activation",
+        type=str,
+        choices=["relu", "gelu", "tanh"],
+        default="relu",
+        help="Activation function for causal_forecaster.",
     )
     parser.add_argument(
         "--control_nodes",
@@ -124,6 +131,32 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
              "Remaining weight is distributed equally among earlier timesteps. "
              "Only applies to causal_forecaster model.",
     )
+    parser.add_argument(
+        "--delta_reg_weight",
+        type=float,
+        default=0.0,
+        help="Weight for anti-copy regularization loss that penalizes small deltas. "
+             "Only applies to causal_forecaster model.",
+    )
+    parser.add_argument(
+        "--delta_margin",
+        type=float,
+        default=0.01,
+        help="Minimum desired delta magnitude for anti-copy regularization. "
+             "Deltas smaller than this are penalized.",
+    )
+    parser.add_argument(
+        "--disable_residual",
+        action="store_true",
+        help="Disable residual connection in causal_forecaster (use direct prediction instead).",
+    )
+    parser.add_argument(
+        "--input_noise_std",
+        type=float,
+        default=0.0,
+        help="Standard deviation of Gaussian noise added to inputs during training. "
+             "Helps prevent model from learning trivial shortcuts.",
+    )
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--device", type=str, default=None)
@@ -136,17 +169,6 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
         choices=["full", "last"],
         default="full",
         help="Compute loss/metrics over the full horizon or only the final step.",
-    )
-    parser.add_argument(
-        "--lag_last_weight_percent",
-        type=float,
-        default=None,
-        help="Percent of input weight assigned to the last lag step; remaining weight is spread across earlier steps.",
-    )
-    parser.add_argument(
-        "--neighbor_only_inputs",
-        action="store_true",
-        help="Use only neighbor history by pre-aggregating inputs with an adjacency matrix that excludes self loops.",
     )
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--val_ratio", type=float, default=0.1)
@@ -266,6 +288,12 @@ def add_counterfactual_subcommand(subparsers: argparse._SubParsersAction[argpars
     parser.add_argument("--clamp_max", type=float, default=None)
     parser.add_argument("--lower_bound", type=float, default=None)
     parser.add_argument("--upper_bound", type=float, default=None)
+    parser.add_argument(
+        "--bounds_std_mult",
+        type=float,
+        default=None,
+        help="Compute per-node bounds as mean +/- N*std from training data for control nodes.",
+    )
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--gpus", type=str, default=None, help="Comma-separated CUDA device IDs, e.g., '0,1'.")
     parser.add_argument("--output_path", type=str, default="counterfactual_samples.pt")
@@ -1314,7 +1342,7 @@ def default_subgraph_dir(dataset: str, data_root: Optional[str | Path]) -> Path:
 
 
 def resolve_tep_control_nodes(dataset: str, data_root: Optional[str | Path], num_nodes: int) -> np.ndarray:
-    if dataset.upper() != "TEP":
+    if not dataset.upper().startswith("TEP"):
         return np.array([], dtype=np.int64)
     dataset_dir = resolve_dataset_dir(dataset, data_root)
     feature_names = load_feature_names(dataset_dir)
@@ -1894,6 +1922,8 @@ def load_forecaster_from_checkpoint(path: Path, device: torch.device, data_root_
     checkpoint_args = checkpoint.get("config", {}).get("args", {})
 
     dataset_name = checkpoint.get("dataset") or checkpoint_args.get("dataset")
+    if isinstance(dataset_name, list):
+        dataset_name = dataset_name[0] if dataset_name else None
     dataset_name = dataset_name.upper() if dataset_name else "METRLA"
     model_type = checkpoint_args.get("model", "stgcn")
     lag = checkpoint_args.get("lag", 12)
@@ -1901,8 +1931,6 @@ def load_forecaster_from_checkpoint(path: Path, device: torch.device, data_root_
     train_ratio = checkpoint_args.get("train_ratio", 0.7)
     val_ratio = checkpoint_args.get("val_ratio", 0.1)
     target_channel = checkpoint_args.get("target_channel", 0)
-    lag_last_weight_percent = checkpoint_args.get("lag_last_weight_percent", None)
-    neighbor_only_inputs = checkpoint_args.get("neighbor_only_inputs", False)
     data_root_value = data_root_override or checkpoint_args.get("data_root")
     data_root = Path(data_root_value) if data_root_value else None
 
@@ -1921,16 +1949,12 @@ def load_forecaster_from_checkpoint(path: Path, device: torch.device, data_root_
     state_key = "model_state" if "model_state" in checkpoint else "model"
     model.load_state_dict(checkpoint[state_key])
     model.eval()
-    lag_weights = forecaster_module.build_lag_weights(lag, lag_last_weight_percent)
     metadata = {
         "lag": lag,
         "horizon": horizon,
         "dataset": dataset_name,
         "target_channel": target_channel,
         "model": model_type,
-        "lag_last_weight_percent": lag_last_weight_percent,
-        "lag_weights": lag_weights,
-        "neighbor_only_inputs": neighbor_only_inputs,
     }
     return model, bundle, metadata
 
@@ -1981,9 +2005,6 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 forecaster,
                 forecaster_input,
                 model_type,
-                lag_weights=dataset_meta.get("lag_weights"),
-                adjacency=bundle.adjacency,
-                neighbor_only_inputs=dataset_meta.get("neighbor_only_inputs", False),
             )
             .squeeze(0)
             .detach()
@@ -2235,8 +2256,39 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                     "finite_diff_eps": args.perturbation_eps,
                 }
 
-            # Use pre-computed scaled bounds for controller
-            x_bounds_scaled = (scaled_lower_bound, scaled_upper_bound) if scaled_lower_bound is not None or scaled_upper_bound is not None else None
+            # Compute per-node bounds if --bounds_std_mult is specified
+            x_bounds_scaled = None
+            if args.bounds_std_mult is not None:
+                # Compute per-node statistics from training data (original scale)
+                node_means, node_stds = compute_node_statistics(
+                    dataset=dataset_meta.get("dataset", ""),
+                    data_root=args.data_root,
+                    train_ratio=dataset_meta.get("train_ratio", 0.7),
+                    target_channel=dataset_meta.get("target_channel", 0),
+                )
+                # Compute bounds in original scale
+                lower_orig = node_means - args.bounds_std_mult * node_stds
+                upper_orig = node_means + args.bounds_std_mult * node_stds
+                # Extract only control node bounds
+                control_lower_orig = lower_orig[control_indices_np]
+                control_upper_orig = upper_orig[control_indices_np]
+                # Transform to standardized scale
+                scaler_mean = short_bundle.scaler.mean
+                scaler_std = short_bundle.scaler.std
+                control_lower_scaled = (control_lower_orig - scaler_mean) / scaler_std
+                control_upper_scaled = (control_upper_orig - scaler_mean) / scaler_std
+                # Convert to tensors
+                scaled_lower_bound = torch.tensor(control_lower_scaled, device=device, dtype=torch.float32)
+                scaled_upper_bound = torch.tensor(control_upper_scaled, device=device, dtype=torch.float32)
+                x_bounds_scaled = (scaled_lower_bound, scaled_upper_bound)
+                # Print per-node bounds for verification
+                print(f"[Per-Node Bounds] Using bounds_std_mult={args.bounds_std_mult}")
+                print(f"[Per-Node Bounds] Control nodes: {control_indices_np.tolist()}")
+                print(f"[Per-Node Bounds] Original scale - lower: {control_lower_orig[:3].tolist()}..., upper: {control_upper_orig[:3].tolist()}...")
+                print(f"[Per-Node Bounds] Standardized - lower: {control_lower_scaled[:3].tolist()}..., upper: {control_upper_scaled[:3].tolist()}...")
+            elif scaled_lower_bound is not None or scaled_upper_bound is not None:
+                # Use pre-computed global scalar bounds
+                x_bounds_scaled = (scaled_lower_bound, scaled_upper_bound)
 
             controller = CausalController(
                 forecaster=short_forecaster,
@@ -2246,8 +2298,6 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                 method=args.control_method,
                 x_bounds=x_bounds_scaled,
                 model_type=short_model_type,
-                lag_weights=short_meta.get("lag_weights"),
-                neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
                 **method_kwargs,
             )
 
@@ -2292,9 +2342,6 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                         short_forecaster,
                         step_input,
                         short_model_type,
-                        lag_weights=short_meta.get("lag_weights"),
-                        adjacency=short_bundle.adjacency,
-                        neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
                     )
                     if step_pred.dim() == 2:
                         step_pred = step_pred.unsqueeze(-1)
@@ -2331,12 +2378,10 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                     baseline=baseline_step,
                     anchor_weights=anchor_step,
                     node_weights=node_weights,
-                    neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
                     masked_target_node=args.target_adjust_node if args.mask_target_history else None,
                     masked_target_channel=target_ch if args.mask_target_history else None,
                     masked_target_value=mask_value if args.mask_target_history else None,
                     model_type=short_model_type,
-                    lag_weights=short_meta.get("lag_weights"),
                 )
 
                 fixed_values = current_window.unsqueeze(0).repeat(args.samples, 1, 1, 1)
@@ -2359,9 +2404,6 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                         short_forecaster,
                         cf_input,
                         short_model_type,
-                        lag_weights=short_meta.get("lag_weights"),
-                        adjacency=short_bundle.adjacency,
-                        neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
                     )
                     if cf_preds.dim() == 2:
                         cf_preds = cf_preds.unsqueeze(-1)
@@ -2469,9 +2511,6 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
                             short_forecaster,
                             cf_input,
                             short_model_type,
-                            lag_weights=short_meta.get("lag_weights"),
-                            adjacency=short_bundle.adjacency,
-                            neighbor_only_inputs=short_meta.get("neighbor_only_inputs", False),
                         )
                         if cf_pred.dim() == 2:
                             cf_pred = cf_pred.unsqueeze(-1)
@@ -2799,7 +2838,25 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
     # Transform CLI bounds from original scale to standardized scale (non-iterative path)
     noniter_scaled_lower = None
     noniter_scaled_upper = None
-    if args.lower_bound is not None or args.upper_bound is not None:
+    if args.bounds_std_mult is not None:
+        # Compute per-node statistics for all nodes (original scale)
+        node_means, node_stds = compute_node_statistics(
+            dataset=dataset_meta.get("dataset", ""),
+            data_root=args.data_root,
+            train_ratio=dataset_meta.get("train_ratio", 0.7),
+            target_channel=dataset_meta.get("target_channel", 0),
+        )
+        # Compute bounds in original scale for all nodes
+        lower_orig = node_means - args.bounds_std_mult * node_stds
+        upper_orig = node_means + args.bounds_std_mult * node_stds
+        # Transform to standardized scale
+        scaler_mean = bundle.scaler.mean
+        scaler_std = bundle.scaler.std
+        noniter_scaled_lower = torch.tensor((lower_orig - scaler_mean) / scaler_std, device=device, dtype=torch.float32)
+        noniter_scaled_upper = torch.tensor((upper_orig - scaler_mean) / scaler_std, device=device, dtype=torch.float32)
+        print(f"[Per-Node Bounds] Non-iterative path: Using bounds_std_mult={args.bounds_std_mult}")
+        print(f"[Per-Node Bounds] Original scale - lower: {lower_orig[:3].tolist()}..., upper: {upper_orig[:3].tolist()}...")
+    elif args.lower_bound is not None or args.upper_bound is not None:
         scaler_mean = bundle.scaler.mean
         scaler_std = bundle.scaler.std
         noniter_scaled_lower = (args.lower_bound - scaler_mean) / scaler_std if args.lower_bound is not None else None
@@ -2819,9 +2876,7 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
         baseline=baseline_forecast,
         anchor_weights=anchor_weights,
         node_weights=node_weights,
-        neighbor_only_inputs=dataset_meta.get("neighbor_only_inputs", False),
         model_type=model_type,
-        lag_weights=dataset_meta.get("lag_weights"),
     )
 
     warm_start = None
@@ -2842,9 +2897,6 @@ def run_counterfactual_command(args: argparse.Namespace) -> None:
             forecaster,
             cf_input,
             model_type,
-            lag_weights=dataset_meta.get("lag_weights"),
-            adjacency=bundle.adjacency,
-            neighbor_only_inputs=dataset_meta.get("neighbor_only_inputs", False),
         )
         cf_preds = cf_preds[:, :, :cf_horizon]
         node_w = node_weights.to(device) if node_weights is not None else torch.ones(bundle.num_nodes, device=device)

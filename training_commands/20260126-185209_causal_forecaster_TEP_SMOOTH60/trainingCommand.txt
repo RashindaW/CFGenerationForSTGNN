@@ -1,0 +1,1 @@
+/home/rashinda/.conda/envs/rashindaNew-torch-env/bin/python train.py --model causal_forecaster --dataset TEP_SMOOTH60 --gpus 2 --lag 20 --horizon 20 --batch_size 64 --epochs 200

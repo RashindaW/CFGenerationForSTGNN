@@ -30,8 +30,6 @@ class CausalController:
         method: str = "gradient",
         x_bounds: Optional[Tuple[float, float]] = None,
         model_type: str = "stgcn",
-        lag_weights: Optional[torch.Tensor] = None,
-        neighbor_only_inputs: bool = False,
         **method_kwargs,
     ):
         """Initialize the unified controller.
@@ -44,8 +42,6 @@ class CausalController:
             method: Control method - "gradient" or "jacobian".
             x_bounds: (min, max) bounds for control values.
             model_type: Type of forecaster model.
-            lag_weights: Optional weights for lag dimensions.
-            neighbor_only_inputs: Whether to use neighbor-only inputs.
             **method_kwargs: Method-specific configuration parameters.
         """
         self.method = method
@@ -70,8 +66,6 @@ class CausalController:
                 config=config,
                 x_bounds=x_bounds,
                 model_type=model_type,
-                lag_weights=lag_weights,
-                neighbor_only_inputs=neighbor_only_inputs,
             )
         elif method == "jacobian":
             config = JacobianConfig(
@@ -88,8 +82,6 @@ class CausalController:
                 config=config,
                 x_bounds=x_bounds,
                 model_type=model_type,
-                lag_weights=lag_weights,
-                neighbor_only_inputs=neighbor_only_inputs,
             )
         elif method == "perturbation":
             config = PerturbationConfig(
@@ -112,8 +104,6 @@ class CausalController:
                 config=config,
                 x_bounds=x_bounds,
                 model_type=model_type,
-                lag_weights=lag_weights,
-                neighbor_only_inputs=neighbor_only_inputs,
                 manipulated_indices=manipulated_indices,
             )
         else:

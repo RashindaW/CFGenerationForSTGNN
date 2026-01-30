@@ -138,6 +138,49 @@ class DataReader:
         return train_data, val_data, test_data
 
 
+def compute_node_statistics(
+    dataset: str,
+    data_root: Optional[Path] = None,
+    train_ratio: float = 0.7,
+    target_channel: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute per-node mean and std from training data (original scale).
+
+    Args:
+        dataset: Dataset name (e.g., "TEP", "TEP_SMOOTH60").
+        data_root: Root directory containing dataset folders.
+        train_ratio: Fraction of data used for training.
+        target_channel: Feature channel to compute statistics for.
+
+    Returns:
+        means: Per-node mean values of shape (num_nodes,).
+        stds: Per-node standard deviation values of shape (num_nodes,).
+    """
+    dataset_upper = dataset.upper()
+    if dataset_upper not in DataReader.DATA_FILES:
+        raise ValueError(f"Dataset {dataset} not supported.")
+
+    base_path = Path(data_root) if data_root is not None else Path(__file__).resolve().parent / "data"
+    files = DataReader.DATA_FILES[dataset_upper]
+    data_dir = base_path / dataset_upper
+    values_path = data_dir / files["values"]
+
+    if not values_path.exists():
+        raise FileNotFoundError(f"Missing dataset file: {values_path}")
+
+    values = np.load(values_path)  # (time, nodes, features)
+
+    # Use only training portion
+    train_end = int(len(values) * train_ratio)
+    train_values = values[:train_end, :, target_channel]  # (train_time, nodes)
+
+    # Compute per-node statistics
+    means = train_values.mean(axis=0)  # (num_nodes,)
+    stds = train_values.std(axis=0)  # (num_nodes,)
+
+    return means, stds
+
+
 def load_dataset(
     dataset: str,
     lag: int = 12,

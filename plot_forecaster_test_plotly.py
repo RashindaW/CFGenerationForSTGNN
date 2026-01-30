@@ -98,9 +98,6 @@ def collect_predictions(
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     model_type: str,
-    lag_weights: Optional[torch.Tensor],
-    adjacency: Optional[torch.Tensor],
-    neighbor_only_inputs: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     preds: List[torch.Tensor] = []
     targets: List[torch.Tensor] = []
@@ -112,9 +109,6 @@ def collect_predictions(
                 model,
                 x,
                 model_type,
-                lag_weights=lag_weights,
-                adjacency=adjacency,
-                neighbor_only_inputs=neighbor_only_inputs,
             )
             preds.append(prediction.cpu())
             targets.append(target.cpu())
@@ -256,9 +250,6 @@ def main_entry() -> None:
             loader,
             device,
             meta.get("model", "causal_forecaster"),
-            meta.get("lag_weights"),
-            bundle.adjacency,
-            meta.get("neighbor_only_inputs", False),
         )
         prediction, ground_truth = flatten_horizon(prediction, ground_truth)
 

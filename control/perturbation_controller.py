@@ -83,8 +83,6 @@ class PerturbationController:
         config: PerturbationConfig,
         x_bounds: Optional[Tuple[float, float]] = None,
         model_type: str = "stgcn",
-        lag_weights: Optional[torch.Tensor] = None,
-        neighbor_only_inputs: bool = False,
         manipulated_indices: Optional[torch.Tensor] = None,
     ):
         """Initialize the perturbation-based controller.
@@ -97,8 +95,6 @@ class PerturbationController:
             config: Optimization configuration.
             x_bounds: (min, max) bounds for control values (optional global bounds).
             model_type: Type of forecaster model.
-            lag_weights: Optional weights for lag dimensions.
-            neighbor_only_inputs: Whether to use neighbor-only inputs.
             manipulated_indices: Global indices of manipulated nodes. Required
                 for causal_forecaster model type to convert between global and
                 local indices.
@@ -110,8 +106,6 @@ class PerturbationController:
         self.config = config
         self.x_bounds = x_bounds
         self.model_type = model_type
-        self.lag_weights = lag_weights
-        self.neighbor_only_inputs = neighbor_only_inputs
         self.manipulated_indices = manipulated_indices
 
         self.device = next(forecaster.parameters()).device
@@ -518,9 +512,6 @@ class PerturbationController:
                 self.forecaster,
                 forecaster_input,
                 self.model_type,
-                lag_weights=self.lag_weights,
-                adjacency=self.adjacency,
-                neighbor_only_inputs=self.neighbor_only_inputs,
             )
             # Shape: (1, num_nodes, horizon) where horizon=1
             # Extract target node predictions using global indices
@@ -558,9 +549,14 @@ class PerturbationController:
             max=upper_bounds,
         )
 
-        # Also apply global bounds if specified
+        # Also apply global/per-node x_bounds if specified
         if self.x_bounds is not None:
             x_min, x_max = self.x_bounds
+            # Handle per-node bounds (tensor) vs global bounds (scalar)
+            if isinstance(x_min, torch.Tensor):
+                x_min = x_min.view(-1, 1)  # (num_control, 1) for broadcasting
+            if isinstance(x_max, torch.Tensor):
+                x_max = x_max.view(-1, 1)  # (num_control, 1) for broadcasting
             x_bounded = torch.clamp(x_bounded, min=x_min, max=x_max)
 
         return x_bounded
