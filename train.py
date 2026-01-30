@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 import tqdm
 import argparse
@@ -623,6 +624,9 @@ def run_epoch(
                     model,
                     x,
                     model_type,
+                    lag_weights=lag_weights,
+                    adjacency=adjacency,
+                    neighbor_only_inputs=neighbor_only_inputs,
                 )
 
             if loss_focus == "last":
@@ -799,6 +803,11 @@ def test_pipeline(args: argparse.Namespace) -> None:
     criterion = nn.L1Loss()
     pbar = tqdm.tqdm(total=1, desc="Testing Progress")
     loss_focus = checkpoint_args.get("loss_focus", "full") if checkpoint_args else "full"
+    lag_last_weight_percent = (
+        checkpoint_args.get("lag_last_weight_percent", args.lag_last_weight_percent) if checkpoint_args else args.lag_last_weight_percent
+    )
+    lag_weights = build_lag_weights(lag, lag_last_weight_percent)
+    neighbor_only_inputs = checkpoint_args.get("neighbor_only_inputs", False) if checkpoint_args else False
     test_stats = run_epoch(
         model,
         loaders["test"],
@@ -806,6 +815,9 @@ def test_pipeline(args: argparse.Namespace) -> None:
         model_type,
         criterion,
         loss_focus=loss_focus,
+        lag_weights=lag_weights,
+        adjacency=bundle.adjacency,
+        neighbor_only_inputs=neighbor_only_inputs,
     )
     pbar.update(1)
     pbar.close()
@@ -854,6 +866,7 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
     criterion = nn.L1Loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = build_scheduler(args, optimizer)
+    lag_weights = build_lag_weights(args.lag, args.lag_last_weight_percent)
 
     run_dir = Path(getattr(args, "resolved_run_dir"))
     checkpoint_path = Path(getattr(args, "resolved_checkpoint_path"))
@@ -878,6 +891,9 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             optimizer=optimizer,
             grad_clip=args.grad_clip,
             distributed=distributed,
+            lag_weights=lag_weights,
+            adjacency=bundle.adjacency,
+            neighbor_only_inputs=args.neighbor_only_inputs,
             delta_reg_weight=getattr(args, "delta_reg_weight", 0.0),
             delta_margin=getattr(args, "delta_margin", 0.01),
             input_noise_std=getattr(args, "input_noise_std", 0.0),
@@ -890,6 +906,9 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             criterion,
             loss_focus=args.loss_focus,
             distributed=distributed,
+            lag_weights=lag_weights,
+            adjacency=bundle.adjacency,
+            neighbor_only_inputs=args.neighbor_only_inputs,
         )
 
         if rank == 0:
