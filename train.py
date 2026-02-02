@@ -6,11 +6,9 @@ import csv
 from dataclasses import asdict
 import math
 import os
-import shlex
-import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -32,6 +30,7 @@ from models.stgcn import STGCN, STGCNConfig
 from models.mstgcn import MSTGCN, MSTGCNConfig
 from models.astgcn import ASTGCN, ASTGCNConfig
 from preprocessing.data_reader import TemporalDatasetBundle, load_dataset
+from utils import safe_torch_load, write_training_command_file
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,13 +39,13 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         choices=["stgcn", "graphwavenet", "mstgcn", "astgcn", "causal_forecaster"],
-        default="stgcn",
+        default="causal_forecaster",
     )
     parser.add_argument(
         "--dataset",
         type=str,
         choices=["METRLA", "PEMSBAY", "TEP", "TEP_SMOOTH10", "TEP_SMOOTH20", "TEP_SMOOTH60", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
-        default="METRLA",
+        default="TEP_SMOOTH10",
     )
     parser.add_argument("--data_root", type=str, default=None, help="Path to dataset root directory.")
     parser.add_argument("--lag", type=int, default=12, help="Number of historical steps.")
@@ -116,28 +115,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tcn_dilation_base", type=int, default=2, help="TCN dilation base for causal_forecaster.")
     parser.add_argument(
-        "--control_last_weight",
-        type=float,
-        default=None,
-        help="Percent (0-100) of weight for last lag timestep of control nodes. "
-             "Remaining weight is distributed equally among earlier timesteps. "
-             "Only applies to causal_forecaster model.",
-    )
-    parser.add_argument(
-        "--delta_reg_weight",
-        type=float,
-        default=0.0,
-        help="Weight for anti-copy regularization loss that penalizes small deltas. "
-             "Only applies to causal_forecaster model.",
-    )
-    parser.add_argument(
-        "--delta_margin",
-        type=float,
-        default=0.01,
-        help="Minimum desired delta magnitude for anti-copy regularization. "
-             "Deltas smaller than this are penalized.",
-    )
-    parser.add_argument(
         "--disable_residual",
         action="store_true",
         help="Disable residual connection in causal_forecaster (use direct prediction instead).",
@@ -177,7 +154,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--disable_gcn", action="store_true")
     parser.add_argument("--disable_adaptive_adj", action="store_true")
-    parser.add_argument("--dist_port", type=int, default=29500, help="TCP port for distributed training rendezvous.")
     args = parser.parse_args()
     args.gpu_ids = parse_gpu_ids(args.gpus)
     return args
@@ -245,9 +221,9 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
-def init_distributed(rank: int, world_size: int, port: int) -> None:
+def init_distributed(rank: int, world_size: int) -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", str(port))
+    os.environ.setdefault("MASTER_PORT", "29500")
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 
@@ -423,7 +399,6 @@ def build_model(args: argparse.Namespace, bundle: TemporalDatasetBundle, device:
             decoder_dropout=args.dropout,
             activation=getattr(args, "activation", "relu"),
             target_channel=args.target_channel,
-            control_last_weight=getattr(args, "control_last_weight", None),
             use_residual=not getattr(args, "disable_residual", False),
         )
         model = CausalDualStreamForecaster(config, adjacency=adjacency)
@@ -540,25 +515,6 @@ def forward_pass(
     return output
 
 
-def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> Tuple[float, float]:
-    mae = torch.mean(torch.abs(pred - target)).item()
-    rmse = torch.sqrt(torch.mean((pred - target) ** 2)).item()
-    return mae, rmse
-
-
-def delta_diversity_loss(delta: torch.Tensor, margin: float) -> torch.Tensor:
-    """Hinge loss penalizing small deltas to prevent 'copy last value' shortcut.
-
-    Args:
-        delta: Predicted delta/change tensor from the model.
-        margin: Minimum desired delta magnitude. Deltas smaller than this are penalized.
-
-    Returns:
-        Scalar loss: mean(max(0, margin - |delta|))
-    """
-    return F.relu(margin - delta.abs()).mean()
-
-
 def run_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -569,8 +525,6 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     grad_clip: float | None = None,
     distributed: bool = False,
-    delta_reg_weight: float = 0.0,
-    delta_margin: float = 0.01,
     input_noise_std: float = 0.0,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
@@ -580,7 +534,6 @@ def run_epoch(
     total_abs_error = 0.0
     total_sq_error = 0.0
     total_elements = 0.0
-    total_delta_reg = 0.0
 
     for batch in loader:
         x, target = prepare_batch(batch, device)
@@ -592,55 +545,17 @@ def run_epoch(
         if is_train:
             optimizer.zero_grad()
         with torch.set_grad_enabled(is_train):
-            # For causal_forecaster with delta regularization, use forward_components
-            if model_type == "causal_forecaster" and delta_reg_weight > 0 and is_train:
-                model_ref = unwrap_model(model)
-
-                # Get components including delta
-                parts = model_ref.forward_components(x)
-                m_delta = parts["M_pred"]  # This is the delta before adding residual
-
-                # Compute prediction with residual if use_residual is True
-                if getattr(model_ref.config, "use_residual", True):
-                    manip_channel = min(model_ref.target_channel, parts["X_manip"].size(-1) - 1)
-                    last_manip = parts["X_manip"][:, -1, :, manip_channel]
-                    m_pred = last_manip.unsqueeze(-1) + m_delta
-                else:
-                    m_pred = m_delta
-
-                # Expand to full prediction
-                full_pred = x.new_zeros((x.size(0), model_ref.num_nodes, m_pred.size(-1)))
-                full_pred.index_copy_(1, model_ref.manipulated_indices, m_pred)
-
-                # Control nodes: use last known value
-                control_channel = min(model_ref.target_channel, parts["X_control"].size(-1) - 1)
-                control_last = parts["X_control"][:, -1, :, control_channel]
-                control_pred = control_last.unsqueeze(-1).repeat(1, 1, m_pred.size(-1))
-                full_pred.index_copy_(1, model_ref.control_indices, control_pred)
-
-                prediction = full_pred
-            else:
-                prediction = forward_pass(
-                    model,
-                    x,
-                    model_type,
-                    lag_weights=lag_weights,
-                    adjacency=adjacency,
-                    neighbor_only_inputs=neighbor_only_inputs,
-                )
+            prediction = forward_pass(
+                model,
+                x,
+                model_type,
+            )
 
             if loss_focus == "last":
                 prediction = prediction[..., -1:]
                 target = target[..., -1:]
             prediction, target = apply_loss_mask(model, prediction, target)
-            base_loss = criterion(prediction, target)
-
-            # Add delta regularization for causal_forecaster
-            loss = base_loss
-            if model_type == "causal_forecaster" and delta_reg_weight > 0 and is_train:
-                delta_reg = delta_diversity_loss(m_delta, delta_margin)
-                loss = base_loss + delta_reg_weight * delta_reg
-                total_delta_reg += delta_reg.item()
+            loss = criterion(prediction, target)
 
             if is_train:
                 loss.backward()
@@ -650,7 +565,7 @@ def run_epoch(
         batch_elements = float(target.numel())
         abs_error = torch.sum(torch.abs(prediction - target)).item()
         sq_error = torch.sum((prediction - target) ** 2).item()
-        total_loss += base_loss.item() * batch_elements
+        total_loss += loss.item() * batch_elements
         total_abs_error += abs_error
         total_sq_error += sq_error
         total_elements += batch_elements
@@ -684,29 +599,6 @@ def resolve_checkpoint_destination(args: argparse.Namespace) -> Tuple[Path, Path
     run_dir = base_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir, run_dir / "best.pt"
-
-
-def _format_training_command() -> str:
-    python_exec = sys.executable or "python"
-    try:
-        arg_string = shlex.join(sys.argv)
-    except AttributeError:
-        arg_string = " ".join(shlex.quote(arg) for arg in sys.argv)
-    return f"{python_exec} {arg_string}".strip()
-
-
-def write_training_command_file(directory: Path, filename: str = "trainingCommand.txt") -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
-    command_path = directory / filename
-    command_path.write_text(_format_training_command() + "\n")
-    return command_path
-
-
-def safe_torch_load(path: Path, device: torch.device) -> Dict[str, Any]:
-    try:
-        return torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=device)
 
 
 def save_checkpoint(
@@ -790,7 +682,7 @@ def test_pipeline(args: argparse.Namespace) -> None:
         val_ratio=val_ratio,
         target_channel=target_channel,
     )
-    loaders = build_dataloaders(bundle, batch_size, num_workers)
+    loaders, _ = build_dataloaders(bundle, batch_size, num_workers)
 
     model_type = checkpoint.get("model_type", getattr(model_args, "model", args.model))
     if checkpoint_args:
@@ -803,11 +695,6 @@ def test_pipeline(args: argparse.Namespace) -> None:
     criterion = nn.L1Loss()
     pbar = tqdm.tqdm(total=1, desc="Testing Progress")
     loss_focus = checkpoint_args.get("loss_focus", "full") if checkpoint_args else "full"
-    lag_last_weight_percent = (
-        checkpoint_args.get("lag_last_weight_percent", args.lag_last_weight_percent) if checkpoint_args else args.lag_last_weight_percent
-    )
-    lag_weights = build_lag_weights(lag, lag_last_weight_percent)
-    neighbor_only_inputs = checkpoint_args.get("neighbor_only_inputs", False) if checkpoint_args else False
     test_stats = run_epoch(
         model,
         loaders["test"],
@@ -815,9 +702,6 @@ def test_pipeline(args: argparse.Namespace) -> None:
         model_type,
         criterion,
         loss_focus=loss_focus,
-        lag_weights=lag_weights,
-        adjacency=bundle.adjacency,
-        neighbor_only_inputs=neighbor_only_inputs,
     )
     pbar.update(1)
     pbar.close()
@@ -830,7 +714,7 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
     world_size = len(gpu_ids) if gpu_ids else 1
     device = None
     if distributed:
-        init_distributed(rank, world_size, args.dist_port)
+        init_distributed(rank, world_size)
         device = torch.device(f"cuda:{gpu_ids[rank]}")
         torch.cuda.set_device(device.index)
     else:
@@ -866,7 +750,6 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
     criterion = nn.L1Loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = build_scheduler(args, optimizer)
-    lag_weights = build_lag_weights(args.lag, args.lag_last_weight_percent)
 
     run_dir = Path(getattr(args, "resolved_run_dir"))
     checkpoint_path = Path(getattr(args, "resolved_checkpoint_path"))
@@ -891,11 +774,6 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             optimizer=optimizer,
             grad_clip=args.grad_clip,
             distributed=distributed,
-            lag_weights=lag_weights,
-            adjacency=bundle.adjacency,
-            neighbor_only_inputs=args.neighbor_only_inputs,
-            delta_reg_weight=getattr(args, "delta_reg_weight", 0.0),
-            delta_margin=getattr(args, "delta_margin", 0.01),
             input_noise_std=getattr(args, "input_noise_std", 0.0),
         )
         val_stats = run_epoch(
@@ -906,9 +784,6 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
             criterion,
             loss_focus=args.loss_focus,
             distributed=distributed,
-            lag_weights=lag_weights,
-            adjacency=bundle.adjacency,
-            neighbor_only_inputs=args.neighbor_only_inputs,
         )
 
         if rank == 0:
@@ -944,7 +819,7 @@ def train_worker(rank: int, args: argparse.Namespace, gpu_ids: Optional[List[int
                 print(f"New best model saved to {checkpoint_path}")
             else:
                 patience_counter += 1
-                if args.patience and patience_counter >= args.patience:
+                if args.patience is not None and args.patience > 0 and patience_counter >= args.patience:
                     print("Early stopping triggered.")
                     stop_training = True
 

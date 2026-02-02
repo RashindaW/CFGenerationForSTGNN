@@ -40,6 +40,7 @@ from models.causal_forecaster import load_feature_names
 from preprocessing.data_reader import TemporalDatasetBundle, compute_node_statistics, load_dataset
 from preprocessing.graphwavenet_utils import StandardScaler
 from train import build_dataloaders, train_pipeline, test_pipeline
+from utils import safe_torch_load, write_training_command_file
 
 
 def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> argparse.ArgumentParser:
@@ -48,13 +49,13 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
         "--model",
         type=str,
         choices=["stgcn", "graphwavenet", "mstgcn", "astgcn", "causal_forecaster"],
-        default="stgcn",
+        default="causal_forecaster",
     )
     parser.add_argument(
         "--dataset",
         type=str,
         choices=["METRLA", "PEMSBAY", "TEP", "TEP_SMOOTH10", "TEP_SMOOTH20", "TEP_SMOOTH60", "METRLA_15", "METRLA_30", "METRLA_SUB", "METRLA_SUB_15", "METRLA_SUB_30"],
-        default="METRLA",
+        default="TEP_SMOOTH10",
     )
     parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--lag", type=int, default=12)
@@ -123,28 +124,6 @@ def add_forecaster_subcommand(subparsers: argparse._SubParsersAction[argparse.Ar
         help="Comma-separated global node indices used as target nodes (subset of manipulated).",
     )
     parser.add_argument("--tcn_dilation_base", type=int, default=2, help="TCN dilation base for causal_forecaster.")
-    parser.add_argument(
-        "--control_last_weight",
-        type=float,
-        default=None,
-        help="Percent (0-100) of weight for last lag timestep of control nodes. "
-             "Remaining weight is distributed equally among earlier timesteps. "
-             "Only applies to causal_forecaster model.",
-    )
-    parser.add_argument(
-        "--delta_reg_weight",
-        type=float,
-        default=0.0,
-        help="Weight for anti-copy regularization loss that penalizes small deltas. "
-             "Only applies to causal_forecaster model.",
-    )
-    parser.add_argument(
-        "--delta_margin",
-        type=float,
-        default=0.01,
-        help="Minimum desired delta magnitude for anti-copy regularization. "
-             "Deltas smaller than this are penalized.",
-    )
     parser.add_argument(
         "--disable_residual",
         action="store_true",
@@ -632,29 +611,6 @@ def append_csv_row(csv_path: Path, headers: list[str], values: list[float]) -> N
         if write_header:
             writer.writerow(headers)
         writer.writerow(values)
-
-
-def _format_training_command() -> str:
-    python_exec = sys.executable or "python"
-    try:
-        arg_string = shlex.join(sys.argv)
-    except AttributeError:
-        arg_string = " ".join(shlex.quote(arg) for arg in sys.argv)
-    return f"{python_exec} {arg_string}".strip()
-
-
-def write_training_command_file(directory: Path, filename: str = "trainingCommand.txt") -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
-    command_path = directory / filename
-    command_path.write_text(_format_training_command() + "\n")
-    return command_path
-
-
-def safe_torch_load(path: Path, device: torch.device) -> Dict[str, Any]:
-    try:
-        return torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=device)
 
 
 def save_diffusion_checkpoint(

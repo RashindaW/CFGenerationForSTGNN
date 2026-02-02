@@ -1,17 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.utils import dense_to_sparse
+from torch_geometric.utils import dense_to_sparse, remove_self_loops, add_self_loops, get_laplacian
 from torch_geometric.data import Data
 from torch_geometric.transforms import LaplacianLambdaMax
 from dataclasses import dataclass
-from typing import List, List, Tuple, Union, Callable, Optional
+from typing import List, Tuple, Union, Optional
 from torch.nn import Parameter
-from torch_geometric.data import Data
 from torch_geometric.typing import OptTensor
 from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.transforms import LaplacianLambdaMax
-from torch_geometric.utils import remove_self_loops, add_self_loops, get_laplacian
 
 
 class ChebConvAttention(MessagePassing):

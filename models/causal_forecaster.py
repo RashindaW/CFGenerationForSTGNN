@@ -350,9 +350,8 @@ class CausalForecasterConfig:
     fusion_rounds: int = 1
     decoder_layers: int = 2
     decoder_dropout: float = 0.1
-    activation: str = "relu"
+    activation: str = "gelu"
     target_channel: int = 0
-    control_last_weight: Optional[float] = None  # Percentage (0-100) of weight for last lag timestep of control nodes
     use_residual: bool = True  # If True, use residual prediction (y = last_value + delta); if False, direct prediction
 
 
@@ -382,13 +381,6 @@ class CausalDualStreamForecaster(nn.Module):
         self.register_buffer("adj_cm", adj_cm)
         self.register_buffer("adj_mm", adj_mm)
         self.register_buffer("adj_mm_norm", normalize_adjacency(adj_mm, mode=config.spatial_norm, add_self_loops=True))
-
-        # Build control lag weights if specified
-        control_lag_weights = self._build_control_lag_weights(config.lag, config.control_last_weight, device)
-        if control_lag_weights is not None:
-            self.register_buffer("control_lag_weights", control_lag_weights)
-        else:
-            self.control_lag_weights = None
 
         self.control_encoder = build_temporal_encoder(
             name=config.temporal_encoder,
@@ -437,45 +429,11 @@ class CausalDualStreamForecaster(nn.Module):
 
         self.loss_node_indices = self.manipulated_indices
 
-    @staticmethod
-    def _build_control_lag_weights(
-        lag: int, control_last_weight: Optional[float], device: torch.device
-    ) -> Optional[torch.Tensor]:
-        """Build lag weights for control nodes.
-
-        Args:
-            lag: Number of lag timesteps.
-            control_last_weight: Percentage (0-100) of weight assigned to the last lag timestep.
-                Remaining weight is distributed equally among earlier timesteps.
-            device: Device to create tensor on.
-
-        Returns:
-            Tensor of shape (lag,) with weights, or None if control_last_weight is None.
-        """
-        if control_last_weight is None:
-            return None
-        if control_last_weight < 0.0 or control_last_weight > 100.0:
-            raise ValueError("control_last_weight must be between 0 and 100.")
-        if lag <= 1:
-            return torch.ones(1, dtype=torch.float32, device=device)
-
-        last_share = control_last_weight / 100.0
-        other_share = (1.0 - last_share) / (lag - 1)
-        weights = torch.full((lag,), other_share, dtype=torch.float32, device=device)
-        weights[-1] = last_share
-        return weights
-
     def forward_components(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         # x: (batch, features, nodes, lag)
         x = x.permute(0, 3, 2, 1).contiguous()  # (batch, lag, nodes, features)
         x_control = x.index_select(2, self.control_indices)  # (batch, lag, num_control, features)
         x_manip = x.index_select(2, self.manipulated_indices)
-
-        # Apply control lag weights if specified
-        # Weights shape: (lag,) -> broadcast to (1, lag, 1, 1)
-        if self.control_lag_weights is not None:
-            weights = self.control_lag_weights.view(1, -1, 1, 1)
-            x_control = x_control * weights
 
         h_control = self.control_encoder(x_control)
         h_manip = self.manip_encoder(x_manip)

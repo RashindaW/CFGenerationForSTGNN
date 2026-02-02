@@ -51,10 +51,26 @@ class DataReader:
         "METRLA_SUB_15": {"values": "node_values.npy", "adjacency": "adj_mat.npy"},
         "METRLA_SUB_30": {"values": "node_values.npy", "adjacency": "adj_mat.npy"},
         "PEMSBAY": {"values": "pems_node_values.npy", "adjacency": "pems_adj_mat.npy"},
-        "TEP": {"values": "causal/node_values_train.npy", "adjacency": "causal/adj_mat_causal.npy"},
-        "TEP_SMOOTH10": {"values": "node_values_train.npy", "adjacency": "adj_mat_causal.npy"},
-        "TEP_SMOOTH20": {"values": "node_values_train.npy", "adjacency": "adj_mat_causal.npy"},
-        "TEP_SMOOTH60": {"values": "node_values_train.npy", "adjacency": "adj_mat_causal.npy"},
+        "TEP": {
+            "values": "causal/node_values_train.npy",
+            "test_values": "causal/node_values_test.npy",
+            "adjacency": "causal/adj_mat_causal.npy",
+        },
+        "TEP_SMOOTH10": {
+            "values": "node_values_train.npy",
+            "test_values": "node_values_test.npy",
+            "adjacency": "adj_mat_causal.npy",
+        },
+        "TEP_SMOOTH20": {
+            "values": "node_values_train.npy",
+            "test_values": "node_values_test.npy",
+            "adjacency": "adj_mat_causal.npy",
+        },
+        "TEP_SMOOTH60": {
+            "values": "node_values_train.npy",
+            "test_values": "node_values_test.npy",
+            "adjacency": "adj_mat_causal.npy",
+        },
     }
 
     def __init__(
@@ -78,21 +94,39 @@ class DataReader:
         self.target_channel = target_channel
 
     def read_data(self) -> TemporalDatasetBundle:
-        values, adjacency = self._load_arrays()
-        num_nodes = values.shape[1]
-        num_features = values.shape[2]
+        train_values, test_values, adjacency = self._load_arrays()
+        num_nodes = train_values.shape[1]
+        num_features = train_values.shape[2]
 
-        # Compute scaler from training data only to avoid data leakage
-        train_end = int(len(values) * self.train_ratio)
-        train_values = values[:train_end]
+        # Compute scaler from training data only (avoid data leakage)
+        if test_values is not None:
+            # TEP datasets: use all of train_values for scaler fitting
+            scaler_data = train_values
+        else:
+            # Other datasets: use first train_ratio portion
+            train_end = int(len(train_values) * self.train_ratio)
+            scaler_data = train_values[:train_end]
 
         scaler = StandardScaler(
-            mean=train_values[..., self.target_channel].mean(),
-            std=train_values[..., self.target_channel].std()
+            mean=scaler_data[..., self.target_channel].mean(),
+            std=scaler_data[..., self.target_channel].std()
         )
-        values[..., self.target_channel] = scaler.transform(values[..., self.target_channel])
 
-        train_data, val_data, test_data = self._split(values)
+        # Apply scaler to train data
+        train_values[..., self.target_channel] = scaler.transform(
+            train_values[..., self.target_channel]
+        )
+
+        if test_values is not None:
+            # TEP datasets: separate train/val from train file, test from test file
+            test_values[..., self.target_channel] = scaler.transform(
+                test_values[..., self.target_channel]
+            )
+            train_data, val_data = self._split_train_val(train_values)
+            test_data = test_values
+        else:
+            # Other datasets: ratio-based split from single file
+            train_data, val_data, test_data = self._split(train_values)
 
         train_dataset = SequenceDataset(train_data, self.lag, self.horizon, self.target_channel)
         val_dataset = SequenceDataset(val_data, self.lag, self.horizon, self.target_channel)
@@ -110,32 +144,63 @@ class DataReader:
             num_features=num_features,
         )
 
-    def _load_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _load_arrays(self) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+        """Load data arrays. Returns (train_values, test_values, adjacency).
+
+        test_values is None for datasets without separate test files.
+        """
         files = self.DATA_FILES[self.dataset]
         data_dir = self.data_root / self.dataset
         values_path = data_dir / files["values"]
         adjacency_path = data_dir / files["adjacency"]
+
         if not values_path.exists() or not adjacency_path.exists():
             raise FileNotFoundError(f"Missing dataset files in {data_dir}")
-        values = np.load(values_path)
+
+        train_values = np.load(values_path)
         adjacency = np.load(adjacency_path)
-        return values, adjacency
+
+        # Load separate test file if available (TEP datasets)
+        test_values = None
+        if "test_values" in files:
+            test_path = data_dir / files["test_values"]
+            if test_path.exists():
+                test_values = np.load(test_path)
+
+        return train_values, test_values, adjacency
 
     def _split(self, values: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Split data into train/val/test sets without overlap to prevent data leakage.
+
+        Each split is contiguous and non-overlapping. The SequenceDataset class
+        handles windowing internally, so we don't need to include extra lag/horizon
+        padding between splits.
+        """
         total = values.shape[0]
         train_end = int(total * self.train_ratio)
         val_end = min(train_end + int(total * self.val_ratio), total)
 
+        # Non-overlapping splits to prevent data leakage
         train_data = values[:train_end]
-
-        val_start = max(train_end - self.lag, 0)
-        val_stop = min(val_end + self.horizon, total)
-        val_data = values[val_start:val_stop]
-
-        test_start = max(val_end - self.lag, 0)
-        test_data = values[test_start:]
+        val_data = values[train_end:val_end]
+        test_data = values[val_end:]
 
         return train_data, val_data, test_data
+
+    def _split_train_val(self, values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Split values into train and validation sets (for datasets with separate test files).
+
+        Uses 80/20 split: 80% train, 20% val from the train file.
+        Non-overlapping to prevent data leakage.
+        """
+        total = values.shape[0]
+        train_end = int(total * 0.8)  # Fixed 80% train, 20% val
+
+        # Non-overlapping splits to prevent data leakage
+        train_data = values[:train_end]
+        val_data = values[train_end:]
+
+        return train_data, val_data
 
 
 def compute_node_statistics(
